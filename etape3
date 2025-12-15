@@ -1,12 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-================================================================================
-  KIDNEY EXCHANGE - HYBRID REALITY ENGINE (VERSION CORRIGÉE)
-  Fusion : Dataset Kaggle Réel (Clinique) + Logique ABO (Statistique)
-  Sortie : Dashboard HTML5 Interactif "Control Center"
-================================================================================
-"""
-
+# rendu georjon thomas et granes victor
 import os
 import json
 import webbrowser
@@ -16,6 +8,15 @@ import networkx as nx
 import kagglehub
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+try:
+    import pulp
+    PULP_AVAILABLE = True
+except Exception:
+    pulp = None
+    PULP_AVAILABLE = False
+    print("[WARN] pulp non installé — l'optimisation ILP utilisera le fallback greedy. Pour installer: pip install pulp")
 
 # --- CONFIGURATION STRICTE ---
 DATASET_REF = "fkshaikh/organ-transplant-dataset"
@@ -108,43 +109,45 @@ class MedicalEngine:
 
     def run_ai_scoring(self):
         print("3. Algorithme de Scoring (IA)...")
-        
-        # CORRECTIF #3: Gestion des divisions par zéro
-        sc_range = self.df['sc'].max() - self.df['sc'].min()
-        if sc_range == 0:
-            sc_norm = np.zeros(len(self.df))
-        else:
-            sc_norm = (self.df['sc'] - self.df['sc'].min()) / sc_range
-        
-        hemo_range = self.df['hemo'].max() - self.df['hemo'].min()
-        if hemo_range == 0:
-            hemo_norm = np.zeros(len(self.df))
-        else:
-            hemo_norm = 1 - ((self.df['hemo'] - self.df['hemo'].min()) / hemo_range)
-        
-        age_norm = self.df['age'] / 100
-        
-        scores = (sc_norm * 0.6) + (hemo_norm * 0.2) + (age_norm * 0.2)
-        
-        if 'dm' in self.df.columns:
-            scores += (self.df['dm'] > 0).astype(int) * 0.1
-        
-        # CORRECTIF #4: Éviter division par zéro dans le scaling
-        max_score = scores.max()
-        if max_score == 0:
-            self.df['urgency'] = 50
-        else:
-            self.df['urgency'] = (scores / max_score) * 100
-        
+        # -> Remplacement heuristique par apprentissage supervisé
+        # Construire une cible synthétique cliniquement informée
+        # (si pas de label réel disponible dans le dataset)
+        print("   > Construction d'un label synthétique pour apprentissage supervisé...")
+        self.df['urgent_label'] = ((self.df['sc'] > 3.5) | (self.df['hemo'] < 9) | (self.df['age'] > 75) | (self.df['dm'] == 1)).astype(int)
+
+        features = ['sc', 'hemo', 'age', 'dm', 'bp']
+        X = self.df[features].copy()
+        y = self.df['urgent_label'].values
+
+        # Normalisation minimale
+        X = self.scaler.fit_transform(X)
+
+        # Petit split pour entraînement/validation
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=SEED, stratify=y)
+        except Exception:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=SEED)
+
+        clf = RandomForestClassifier(n_estimators=100, random_state=SEED)
+        clf.fit(X_train, y_train)
+
+        # Probabilité d'urgence (score continu entre 0 et 1)
+        probs = clf.predict_proba(self.scaler.transform(self.df[features]))[:, 1]
+
+        # Convertir en score 0-100
+        self.df['urgency'] = (probs - probs.min()) / (probs.max() - probs.min() + 1e-12) * 100
+
+        # Top patient selon probabilité prédite
         idx_max = self.df['urgency'].idxmax()
         row = self.df.loc[idx_max]
         self.top_patient = {
             'id': int(idx_max),
-            'score': int(row['urgency']),
+            'score': int(round(row['urgency'])),
             'sc': round(float(row['sc']), 2),
             'age': int(row['age']),
             'blood': str(row['patient_blood'])
         }
+        print("   > Modèle RandomForest entraîné. Exemple AUC/score non affiché (env local).")
 
     def run_game_theory(self):
         """
@@ -254,27 +257,46 @@ class MedicalEngine:
         valid_cycles.sort(key=cycle_social_utility, reverse=True)
         print(f"   > Cycles triés par utilité (Pareto optimality)")
         
-        # --- ÉTAPE 4: SÉLECTION GREEDY (Stable Matching) ---
-        """
-        ALGORITHME GALE-SHAPLEY ADAPTÉ:
-        - Sélectionner cycles à plus haute utilité
-        - Garantie: Aucun deux cycles ne partagent un nœud
-        - Résultat: Matching stable + maximal localement
-        """
+        # --- ÉTAPE 4: SÉLECTION OPTIMALE (PLNE) ---
+        # On formule la sélection comme un problème en nombres entiers:
+        # max Σ utilité(cycle) * x_cycle  s.t. pour chaque nœud Σ_{cycle ∋ nœud} x_cycle ≤ 1
+        # Cela respecte strictement la contrainte de disjonction et maximise le surplus social.
         self.cycles = []
         used_nodes = set()
-        
-        for cycle in valid_cycles:
-            # Vérifier qu'aucun nœud du cycle n'est déjà utilisé
-            if any(node in used_nodes for node in cycle):
-                continue
-            
-            # Ajouter ce cycle à la solution
-            self.cycles.append(cycle)
-            used_nodes.update(cycle)
-        
-        print(f"   > {len(self.cycles)} cycles sélectionnés (Stable Matching)")
-        print(f"   > {len(used_nodes)} patients sauvés par échanges")
+        try:
+            utilities = [cycle_social_utility(c) for c in valid_cycles]
+            prob = pulp.LpProblem("kidney_cycles", pulp.LpMaximize)
+            x_vars = [pulp.LpVariable(f"x_{i}", cat='Binary') for i in range(len(valid_cycles))]
+            prob += pulp.lpSum([utilities[i] * x_vars[i] for i in range(len(valid_cycles))])
+
+            # Contraintes: chaque nœud au plus dans une coalition
+            for node in nodes:
+                prob += pulp.lpSum([x_vars[i] for i, c in enumerate(valid_cycles) if node in c]) <= 1
+
+            # Solveur CBC (inclus avec pulp) - silencieux
+            prob.solve(pulp.PULP_CBC_CMD(msg=False))
+
+            # Récupérer solution
+            for i, var in enumerate(x_vars):
+                val = pulp.value(var)
+                if val is not None and val > 0.5:
+                    self.cycles.append(valid_cycles[i])
+
+            used_nodes = set(n for c in self.cycles for n in c)
+            print(f"   > {len(self.cycles)} cycles sélectionnés (optimaux via ILP)")
+            print(f"   > {len(used_nodes)} patients sauvés par échanges")
+        except Exception as e:
+            print(f"   > [WARN] Sélection ILP échouée: {e} — fallback greedy")
+            # Fallback: méthode greedy (ancienne approche)
+            self.cycles = []
+            used_nodes = set()
+            for cycle in valid_cycles:
+                if any(node in used_nodes for node in cycle):
+                    continue
+                self.cycles.append(cycle)
+                used_nodes.update(cycle)
+            print(f"   > {len(self.cycles)} cycles sélectionnés (Stable Matching greedy)")
+            print(f"   > {len(used_nodes)} patients sauvés par échanges")
         
         # --- ÉTAPE 5: RAPPORT D'ÉQUILIBRE (Game Theory Metrics) ---
         print("\n   === ANALYSE THÉORIE DES JEUX ===")
