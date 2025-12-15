@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""
+╔════════════════════════════════════════════════════════════════════════════╗
+║         DCGAN: DEEP CONVOLUTIONAL GENERATIVE ADVERSARIAL NETWORK          ║
+║          Medical Image Synthesis via Synthetic Data Augmentation           ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+PURPOSE:
+========
+Generate synthetic medical images (X-Ray, MRI, CT scans, histology, etc.) using
+a Deep Convolutional Generative Adversarial Network (DCGAN) to augment limited
+medical datasets.
+
+WHY DCGAN FOR MEDICAL DATA AUGMENTATION?
+=========================================
+1. SMALL DATASETS: Medical data is expensive to collect and often limited in
+   quantity. GANs can synthesize realistic new training examples.
+
+2. RARE PATHOLOGIES: It's hard to collect many examples of rare diseases.
+   A trained GAN can generate more samples of uncommon conditions, helping
+   classifiers learn from diverse cases.
+
+3. PRIVACY: GANs can generate realistic synthetic images without directly
+   exposing real patient data, helping meet privacy regulations (GDPR, HIPAA).
+
+4. DOMAIN ADAPTATION: Train on synthetic data then transfer to real data, or
+   augment real training sets to improve model robustness.
+
+DCGAN WORKFLOW:
+===============
+1. Generator (G): Takes random noise → learns to produce fake images
+   - Starts terrible (random noise)
+   - Progressively learns realistic patterns
+   
+2. Discriminator (D): Classifies images as real or fake
+   - Initially random at guessing
+   - Learns to spot G's fakes
+   
+3. Adversarial Loop:
+   - D tries to correctly classify real vs. fake
+   - G tries to fool D by improving fake quality
+   - Both improve each other over time
+   
+4. Evaluation: Save images from a fixed noise vector each epoch
+   - Same noise -> see visual progress of G over time
+   - Proof that G is learning
+
+CURRENT SETUP:
+==============
+Dataset: MNIST (handwritten digits) as a fast proxy
+Real Use: Replace with medical images (DICOM, PNG, NIFTI, etc.)
+
+OUTPUT FILES:
+=============
+- progress_images/epoch_001.png, epoch_002.png, ... (visual progress tracking)
+- netG_final.pth (trained generator state dict, can be reused/fine-tuned)
+- netD_final.pth (trained discriminator state dict)
+
+USAGE EXAMPLES:
+===============
+  python code2.txt --dataset MNIST --epochs 10 --batch_size 128
+  python code2.txt --dataset FashionMNIST --epochs 30 --num_visualize 64
+  python code2.txt --force_cpu --epochs 5  # Use CPU if no CUDA
+
+IMPORTANT CAVEATS (Medical Use):
+=================================
+- Generated images MUST be validated by radiologists/clinicians
+- Check for artifacts, hallucinations, or anatomically impossible features
+- Use synthetic images only for research/training; never for clinical decisions
+- Follow regulatory guidelines (FDA, CE marking, etc.) when deploying ML models
+- Consider data governance and patient privacy laws
+"""
+
+import argparse       # Command-line argument parsing
+import os             # OS utilities
+import random         # Randomness (seed control for reproducibility)
+from pathlib import Path  # Modern path handling
+import time          # Timing code execution
+
+import torch                          # PyTorch: deep learning framework
+import torch.nn as nn                 # Neural network layers (Conv2d, etc.)
+import torch.optim as optim           # Optimizers (Adam, SGD)
+from torch.utils.data import DataLoader  # Batched data loading
+import torchvision                    # Vision utilities
+import torchvision.transforms as transforms  # Image preprocessing
+from torchvision.utils import save_image    # Save image grids to .png
+from tqdm import tqdm                 # Progress bars
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GENERATOR NETWORK
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Generator(nn.Module):
+	"""
+	GENERATOR: Maps random noise to synthetic images
+	
+	ARCHITECTURE:
+	=============
+	Input:  noise vector of shape (batch_size, nz, 1, 1)
+	    e.g., (128, 100, 1, 1) = 128 samples of 100D noise vectors
+	    
+	Output: synthetic image of shape (batch_size, nc, 64, 64)
+	    e.g., (128, 1, 64, 64) = 128 grayscale 64x64 images
+	
+	Upsampling Path:
+	    1x1 noise -> 4x4 -> 8x8 -> 16x16 -> 32x32 -> 64x64 image
+	
+	KEY COMPONENTS:
+	===============
+	- ConvTranspose2d (fractionally-strided convolution):
+	    Learnable upsampling. Inverse of regular convolution.
+	    Learns what features should appear at each resolution level.
+	    
+	- BatchNorm2d:
+	    Normalizes activation values within each batch.
+	    Stabilizes training, reduces internal covariate shift.
+	    Helps gradients flow better during backpropagation.
+	    
+	- ReLU (Rectified Linear Unit):
+	    Non-linearity: max(0, x)
+	    Allows network to learn complex, non-linear mappings.
+	    
+	- Tanh (final layer):
+	    Squashes output to range [-1, 1]
+	    Matches normalized image values (images normalized to [-1, 1])
+	    Important: if data is [0, 1], use Sigmoid instead
+	
+	MEDICAL IMAGING ADAPTATIONS:
+	=============================
+	- Increase 'nz' (noise dimension) for more diversity
+	  E.g., 100 -> 200-256 for complex medical structures
+	  
+	- Increase 'ngf' (num generator filters) for better quality
+	  E.g., 64 -> 128 or 256 for finer anatomical details
+	  
+	- Change 'nc' for multi-channel images
+	  nc=1 for grayscale (radiograph, ultrasound)
+	  nc=3 for RGB or pseudo-color (e.g., thermal maps)
+	  nc=5+ for multi-modality fusion (combine MRI + CT)
+	  
+	- Use skip connections for deeper networks
+	  Better gradient flow = easier training of deeper generators
+	  
+	- Add spectral normalization for training stability
+	"""
+	def __init__(self, nz=100, ngf=64, nc=1):
+		"""
+		Initialize Generator.
+		
+		Args:
+		    nz (int): Dimension of input noise vector. 
+		              Larger = more potential diversity in outputs.
+		              Typical: 50-200 depending on complexity.
+		              
+		    ngf (int): Base number of filters in generator layers.
+		               Larger = more parameters = better quality but slower.
+		               Typical: 64, 128, 256
+		               
+		    nc (int): Number of output image channels.
+		             1 = grayscale, 3 = RGB, etc.
+		"""
+		super().__init__()
+		self.main = nn.Sequential(
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 1: Expand noise from (batch, nz, 1, 1) to 4x4 feature map
+			# ─────────────────────────────────────────────────────────────
+			# ConvTranspose2d(in_channels, out_channels, kernel_size, ...)
+			#
+			# kernel_size=4, stride=1, padding=0:
+			#   Input:  (batch, nz, 1, 1)
+			#   Output: (batch, ngf*8, 4, 4)
+			#   Reason: output_size = (input-1)*stride - 2*padding + kernel_size
+			#           (1-1)*1 - 0 + 4 = 4 ✓
+			#
+			# bias=False: we'll use BatchNorm, which includes its own bias
+			nn.ConvTranspose2d(nz, ngf * 8, kernel_size=4, stride=1, padding=0, bias=False),
+			nn.BatchNorm2d(ngf * 8),      # Normalize across batch dimension
+			nn.ReLU(True),                 # Non-linearity (inplace=True saves memory)
+			# Output: (batch, 512, 4, 4) assuming ngf=64
+			
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 2: Upsample from 4x4 to 8x8, reduce channels
+			# ─────────────────────────────────────────────────────────────
+			# kernel_size=4, stride=2, padding=1:
+			#   Input:  (batch, ngf*8, 4, 4)
+			#   Output: (batch, ngf*4, 8, 8)
+			#   output_size = (4-1)*2 - 2*1 + 4 = 3*2 - 2 + 4 = 8 ✓
+			nn.ConvTranspose2d(ngf * 8, ngf * 4, kernel_size=4, stride=2, padding=1, bias=False),
+			nn.BatchNorm2d(ngf * 4),
+			nn.ReLU(True),
+			# Output: (batch, 256, 8, 8)
+			
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 3: Upsample from 8x8 to 16x16
+			# ─────────────────────────────────────────────────────────────
+			nn.ConvTranspose2d(ngf * 4, ngf * 2, kernel_size=4, stride=2, padding=1, bias=False),
+			nn.BatchNorm2d(ngf * 2),
+			nn.ReLU(True),
+			# Output: (batch, 128, 16, 16)
+			
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 4: Upsample from 16x16 to 32x32
+			# ─────────────────────────────────────────────────────────────
+			nn.ConvTranspose2d(ngf * 2, ngf, kernel_size=4, stride=2, padding=1, bias=False),
+			nn.BatchNorm2d(ngf),
+			nn.ReLU(True),
+			# Output: (batch, 64, 32, 32)
+			
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 5: Final upsample from 32x32 to 64x64, output image
+			# ─────────────────────────────────────────────────────────────
+			# Project to 'nc' channels (1 for grayscale, 3 for RGB)
+			# Use Tanh to squash values to [-1, 1]
+			nn.ConvTranspose2d(ngf, nc, kernel_size=4, stride=2, padding=1, bias=False),
+			nn.Tanh()  # Squashes output to [-1, 1], matching normalized data
+			# Output: (batch, 1, 64, 64) for grayscale
+		)
+
+	def forward(self, noise):
+		"""
+		Generate synthetic images from noise vectors.
+		
+		Args:
+		    noise: Tensor of shape (batch_size, nz, 1, 1) containing random values
+		           E.g., torch.randn(128, 100, 1, 1) for batch_size=128
+		           
+		Returns:
+		    images: Tensor of shape (batch_size, nc, 64, 64) with values in [-1, 1]
+		            These are the synthetic images G learned to create
+		"""
+		return self.main(noise)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DISCRIMINATOR NETWORK
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Discriminator(nn.Module):
+	"""
+	DISCRIMINATOR: Distinguishes real images from generator fakes
+	
+	ARCHITECTURE:
+	=============
+	Input:  image of shape (batch_size, nc, 64, 64)
+	Output: probability [0, 1] that image is real (via Sigmoid)
+	
+	Downsampling Path:
+	    64x64 image -> 32x32 -> 16x16 -> 8x8 -> 4x4 -> scalar [0, 1]
+	
+	KEY COMPONENTS:
+	===============
+	- Conv2d (regular convolution):
+	    Learned feature extraction with sliding filters
+	    Progressively extracts low-level (edges) to high-level (objects) features
+	    
+	- BatchNorm2d:
+	    Stabilizes training, but usually NOT applied to first layer
+	    Why? First layer directly sees raw images which can vary widely;
+	    BatchNorm on raw inputs can be destabilizing.
+	    
+	- LeakyReLU (negative_slope=0.2):
+	    Like ReLU but allows small gradient flow for negative inputs: f(x) = x if x>0, 0.2*x if x<0
+	    Prevents "dead neurons" where gradients become zero
+	    Helps training stability in GAN's adversarial setting
+	    
+	- Sigmoid (final layer):
+	    Squashes final output to [0, 1]
+	    Output ≈ 0 means "fake", output ≈ 1 means "real"
+	
+	TRAINING OBJECTIVE:
+	====================
+	Maximize: classify real images as 1, fake images as 0
+	Loss = -[log(D(real)) + log(1 - D(fake))]
+	
+	If D outputs are good:
+	  - D(real) ≈ 1 -> log(1) ≈ 0 (good, real classified correctly)
+	  - D(fake) ≈ 0 -> log(1) ≈ 0 (good, fake classified correctly)
+	
+	MEDICAL IMAGING ADAPTATIONS:
+	=============================
+	- Increase 'ndf' for higher capacity discrimination
+	  E.g., 64 -> 128-256 to detect subtle anatomical artifacts
+	  
+	- Add Spectral Normalization:
+	  Constrains weight matrices, stabilizes training
+	  Useful when working with medical images where training is finicky
+	  
+	- Consider Label Smoothing:
+	  Instead of targets [0, 1], use [0.1, 0.9] or [0, 0.9]
+	  Prevents D from being overconfident, helps G training
+	  
+	- Add Dropout layers:
+	  Reduces overfitting to training set of real images
+	  Helps D generalize better to varied fake images from G
+	"""
+	def __init__(self, nc=1, ndf=64):
+		"""
+		Initialize Discriminator.
+		
+		Args:
+		    nc (int): Number of input image channels.
+		             1 = grayscale (radiograph, MRI)
+		             3 = RGB (color photography)
+		             
+		    ndf (int): Base number of filters in discriminator layers.
+		              Larger = higher capacity but more parameters
+		              Typical: 64, 128, 256
+		"""
+		super().__init__()
+		self.main = nn.Sequential(
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 1: Input features at 64x64
+			# ─────────────────────────────────────────────────────────────
+			# No BatchNorm on first layer (raw pixel values vary widely)
+			# kernel_size=4, stride=2, padding=1:
+			#   Input:  (batch, nc, 64, 64)
+			#   Output: (batch, ndf, 32, 32)
+			#   output_size = floor((64 + 2*1 - 4) / 2 + 1) = floor(62/2 + 1) = 32 ✓
+			nn.Conv2d(nc, ndf, kernel_size=4, stride=2, padding=1, bias=False),
+			nn.LeakyReLU(0.2, inplace=True),  # negative_slope=0.2
+			# Output: (batch, 64, 32, 32)
+			
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 2: Downsample to 16x16, increase feature channels
+			# ─────────────────────────────────────────────────────────────
+			# Now we add BatchNorm (input diversity is reduced after first conv)
+			nn.Conv2d(ndf, ndf * 2, kernel_size=4, stride=2, padding=1, bias=False),
+			nn.BatchNorm2d(ndf * 2),
+			nn.LeakyReLU(0.2, inplace=True),
+			# Output: (batch, 128, 16, 16)
+			
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 3: Downsample to 8x8
+			# ─────────────────────────────────────────────────────────────
+			nn.Conv2d(ndf * 2, ndf * 4, kernel_size=4, stride=2, padding=1, bias=False),
+			nn.BatchNorm2d(ndf * 4),
+			nn.LeakyReLU(0.2, inplace=True),
+			# Output: (batch, 256, 8, 8)
+			
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 4: Downsample to 4x4, concentrate information
+			# ─────────────────────────────────────────────────────────────
+			nn.Conv2d(ndf * 4, ndf * 8, kernel_size=4, stride=2, padding=1, bias=False),
+			nn.BatchNorm2d(ndf * 8),
+			nn.LeakyReLU(0.2, inplace=True),
+			# Output: (batch, 512, 4, 4)
+			
+			# ─────────────────────────────────────────────────────────────
+			# LAYER 5: Collapse to scalar (real/fake classification)
+			# ─────────────────────────────────────────────────────────────
+			# kernel_size=4, stride=1, padding=0:
+			#   Input:  (batch, ndf*8, 4, 4)
+			#   Output: (batch, 1, 1, 1)
+			#   output_size = floor((4 + 0 - 4) / 1 + 1) = 1 ✓
+			nn.Conv2d(ndf * 8, 1, kernel_size=4, stride=1, padding=0, bias=False),
+			nn.Sigmoid()  # Squashes to [0, 1]: 0=fake, 1=real
+			# Output: (batch, 1, 1, 1)
+		)
+
+	def forward(self, image):
+		"""
+		Classify image as real or fake.
+		
+		Args:
+		    image: Tensor of shape (batch_size, nc, 64, 64)
+		           Expected normalized to [-1, 1]
+		           
+		Returns:
+		    prob: Tensor of shape (batch_size,) with values in [0, 1]
+		          prob[i] ≈ 0 means image i looks fake
+		          prob[i] ≈ 1 means image i looks real
+		"""
+		# Forward through convolutional blocks: (batch, nc, 64, 64) -> (batch, 1, 1, 1)
+		output = self.main(image)
+		# Reshape (batch, 1, 1, 1) -> (batch,) for loss computation
+		return output.view(-1, 1).squeeze(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WEIGHT INITIALIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def weights_init(m):
+	"""
+	Initialize model weights according to DCGAN paper recommendations.
+	
+	DCGAN WEIGHT INITIALIZATION STRATEGY:
+	====================================
+	The original DCGAN paper found that careful initialization is crucial for
+	stable adversarial training.
+	
+	- Conv/ConvTranspose2d: Normal distribution, mean=0, std=0.02
+	  Small random values help break symmetry (different neurons learn different features)
+	  Std=0.02 is empirically found to work well
+	
+	- BatchNorm weights: Normal distribution, mean=1.0, std=0.02
+	  Biases initialized to 0
+	  BatchNorm learns scale and shift, so we initialize near identity
+	
+	WHY NOT ZEROS?
+	- All neurons would be identical -> no diversity in features
+	- Network would collapse to trivial solutions
+	
+	WHY NOT TOO LARGE?
+	- Large initial weights -> large activations -> can lead to saturation (tanh/sigmoid)
+	- Saturation -> gradients become very small -> training is slow
+	
+	Args:
+	    m: PyTorch module (layer) to initialize
+	"""
+	classname = m.__class__.__name__
+	
+	# Initialize convolutional layers
+	if classname.find('Conv') != -1:
+		# Normal distribution: mean=0, std=0.02
+		nn.init.normal_(m.weight.data, 0.0, 0.02)
+	
+	# Initialize BatchNorm layers
+	elif classname.find('BatchNorm') != -1:
+		# BatchNorm weight: Normal distribution, mean=1.0 (identity), std=0.02
+		nn.init.normal_(m.weight.data, 1.0, 0.02)
+		# BatchNorm bias: zeros
+		nn.init.constant_(m.bias.data, 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DATA LOADING
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_data_loader(dataset_name='MNIST', batch_size=128, image_size=64, data_root='./data'):
+	"""
+	Load and preprocess image dataset.
+	
+	IMAGE NORMALIZATION:
+	====================
+	MNIST/FashionMNIST images come in [0, 1] (8-bit pixel values / 255)
+	We normalize to [-1, 1] using:
+	    (x - mean) / std, where mean=0.5, std=0.5
+	
+	Why [-1, 1]?
+	- Generator outputs Tanh: squashes to [-1, 1]
+	- Better numerical stability for neural networks
+	- Symmetric around 0: facilitates learning
+	
+	MEDICAL IMAGES:
+	===============
+	When using real medical data, adapt as follows:
+	
+	1. DICOM format:
+	   - Load with pydicom or SimpleITK
+	   - Extract pixel array: pixels = dcm.pixel_array
+	   - Rescale using Rescale Slope/Intercept: pixels = pixels * slope + intercept
+	   - Normalize to [-1, 1]: (pixels - mean) / std
+	   
+	2. CT/MRI Hounsfield Units:
+	   - CT: typically -1000 to +3000 HU
+	   - Apply window: (pixels - center) / width * 2, clip to [-1, 1]
+	   - E.g., lung window: center=-400, width=1200
+	   
+	3. Histogram Equalization:
+	   - Enhance contrast if images are low-contrast (e.g., ultrasound)
+	   - Use torchvision.transforms.functional or OpenCV
+	   
+	4. Multi-channel:
+	   - Stack multiple modalities (e.g., T1 + T2 MRI)
+	   - Adjust nc (number of channels) in Generator/Discriminator
+	
+	Args:
+	    dataset_name (str): 'MNIST' or 'FashionMNIST'
+	    batch_size (int): Samples per batch (larger = faster training but more GPU memory)
+	    image_size (int): Target image size (must be power of 2 for DCGAN)
+	    data_root (str): Path to save/load dataset
+	
+	Returns:
+	    DataLoader: Iterable that yields (images, labels) tuples
+	"""
+	# Define preprocessing pipeline
+	transform = transforms.Compose([
+		# Resize all images to (image_size, image_size)
+		# MNIST is 28x28, we resize to 64x64 for better generator capacity
+		transforms.Resize(image_size),
+		
+		# Convert PIL image to PyTorch tensor, values in [0, 1]
+		transforms.ToTensor(),
+		
+		# Normalize to [-1, 1] using mean=0.5, std=0.5
+		# Formula: (x - 0.5) / 0.5 = 2*x - 1
+		transforms.Normalize((0.5,), (0.5,))
+	])
+
+	# Load dataset
+	if dataset_name.lower() == 'fashionmnist':
+		dataset = torchvision.datasets.FashionMNIST(
+			root=data_root,
+			train=True,           # Use training split (not test)
+			download=True,        # Auto-download if missing
+			transform=transform
+		)
+	else:  # Default to MNIST
+		dataset = torchvision.datasets.MNIST(
+			root=data_root,
+			train=True,
+			download=True,
+			transform=transform
+		)
+
+	# Create DataLoader for batching and shuffling
+	loader = DataLoader(
+		dataset,
+		batch_size=batch_size,
+		shuffle=True,           # Randomize order each epoch (helps training)
+		num_workers=2,          # Parallel data loading (faster)
+		drop_last=True          # Drop last incomplete batch (consistent batch sizes)
+	)
+	
+	return loader
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRAINING LOOP
+# ═══════════════════════════════════════════════════════════════════════════
+
+def train(args):
+	"""
+	Main training loop for DCGAN.
+	
+	ADVERSARIAL TRAINING DYNAMICS:
+	=============================
+	
+	Each iteration:
+	
+	1. UPDATE DISCRIMINATOR (D):
+	   Goal: Correctly classify real images as 1, fake as 0
+	   
+	   Loss = BCELoss(D(real_images), 1) + BCELoss(D(fake_images), 0)
+	   
+	   D tries to minimize this loss:
+	   - Maximize D(real) -> close to 1
+	   - Minimize D(fake) -> close to 0
+	
+	2. UPDATE GENERATOR (G):
+	   Goal: Create images that fool D (make D output close to 1)
+	   
+	   Loss = BCELoss(D(G(noise)), 1)
+	   
+	   G tries to minimize this loss:
+	   - Maximize D(G(noise)) -> trick D into thinking fakes are real
+	
+	WHY DETACH in D step?
+	- When training D, we don't want gradients flowing through G
+	- .detach() breaks the computational graph
+	- Why? D should improve based on real/fake classification,
+	  not on how to improve G (that's G's job)
+	
+	FIXED NOISE VISUALIZATION:
+	==========================
+	- Create a fixed noise vector at start: fixed_noise = randn(64, 100, 1, 1)
+	- Each epoch, generate images from fixed_noise: fake = G(fixed_noise)
+	- Save as grid to see visual progression
+	- Same input -> can watch G learn (details, contrast, shapes improve)
+	
+	TRAINING TIPS:
+	===============
+	- Use learning rate 0.0002 (from DCGAN paper)
+	- Use Adam optimizer with beta1=0.5 (not default 0.9)
+	  Helps adversarial stability
+	- Batch size 128 is standard for DCGAN
+	- Monitor D and G losses: both should fluctuate, not collapse
+	"""
+	# Determine device (GPU if available, else CPU)
+	device = torch.device('cuda' if torch.cuda.is_available() and not args.force_cpu else 'cpu')
+	print(f"Using device: {device}")
+
+	# Create output directory for progress images
+	out_dir = Path('progress_images')
+	out_dir.mkdir(parents=True, exist_ok=True)
+
+	# Load training data
+	dataloader = get_data_loader(args.dataset, args.batch_size, args.image_size, data_root=args.data_root)
+
+	# Model hyperparameters
+	nz = args.nz              # Noise dimension
+	nc = args.nc              # Image channels
+	ngf = args.ngf            # Generator filters
+	ndf = args.ndf            # Discriminator filters
+
+	# Instantiate models
+	netG = Generator(nz=nz, ngf=ngf, nc=nc).to(device)
+	netD = Discriminator(nc=nc, ndf=ndf).to(device)
+
+	# Initialize weights according to DCGAN paper
+	netG.apply(weights_init)
+	netD.apply(weights_init)
+
+	# Loss function: Binary Cross-Entropy (real=1, fake=0)
+	criterion = nn.BCELoss()
+
+	# Optimizers: Adam with learning rate 0.0002, beta1=0.5
+	# beta1=0.5 is crucial for adversarial stability (default is 0.9)
+	optimizerD = optim.Adam(netD.parameters(), lr=args.lr, betas=(0.5, 0.999))
+	optimizerG = optim.Adam(netG.parameters(), lr=args.lr, betas=(0.5, 0.999))
+
+	# Create fixed noise vector for progress visualization
+	# Each epoch, we generate images from this SAME noise
+	# So we can see how quality improves
+	fixed_noise = torch.randn(args.num_visualize, nz, 1, 1, device=device)
+	
+	# Labels for training
+	real_label = 1.
+	fake_label = 0.
+
+	print(f"Starting training on {device}...")
+	print(f"Epochs: {args.epochs}, Batch size: {args.batch_size}")
+	print(f"Output: {out_dir}/epoch_*.png\n")
+
+	iters = 0
+	start_time = time.time()
+	
+	# ─────────────────────────────────────────────────────────────────────
+	# EPOCH LOOP
+	# ─────────────────────────────────────────────────────────────────────
+	for epoch in range(1, args.epochs + 1):
+		epoch_start = time.time()
+		progress = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}", unit='batch')
+		
+		for i, (data, _) in enumerate(progress):  # Ignore labels, only use images
+			
+			# ─────────────────────────────────────────────────────────────
+			# TRAIN DISCRIMINATOR
+			# ─────────────────────────────────────────────────────────────
+			netD.zero_grad()  # Clear old gradients
+			
+			# === Real images ===
+			real_cpu = data.to(device)
+			b_size = real_cpu.size(0)
+			label = torch.full((b_size,), real_label, device=device)  # All 1s
+
+			output = netD(real_cpu)  # D predicts real images
+			errD_real = criterion(output, label)  # BCE loss: encourage output ≈ 1
+			errD_real.backward()  # Compute gradients
+			D_x = output.mean().item()  # Average D output on real (should be ~1)
+
+			# === Fake images ===
+			noise = torch.randn(b_size, nz, 1, 1, device=device)
+			fake = netG(noise)  # Generate fake images
+			label.fill_(fake_label)  # All 0s
+
+			output = netD(fake.detach())  # D predicts fake images (detach G to not update it)
+			errD_fake = criterion(output, label)  # BCE loss: encourage output ≈ 0
+			errD_fake.backward()  # Compute gradients
+			D_G_z1 = output.mean().item()  # Average D output on fake (should be ~0)
+			
+			# Total discriminator loss
+			errD = errD_real + errD_fake
+			optimizerD.step()  # Update D weights
+
+			# ─────────────────────────────────────────────────────────────
+			# TRAIN GENERATOR
+			# ─────────────────────────────────────────────────────────────
+			netG.zero_grad()  # Clear old gradients
+			label.fill_(real_label)  # We want D to think fake images are real (1s)
+
+			output = netD(fake)  # D predicts fake images (now with G gradients enabled)
+			errG = criterion(output, label)  # BCE loss: encourage D output ≈ 1
+			errG.backward()  # Compute gradients
+			D_G_z2 = output.mean().item()  # Average D output on fake (should increase toward 1)
+			optimizerG.step()  # Update G weights
+
+			iters += 1
+			
+			# Log progress every N batches
+			if i % args.log_interval == 0:
+				progress.set_postfix({
+					'errD': f'{errD.item():.3f}',
+					'errG': f'{errG.item():.3f}',
+					'D(x)': f'{D_x:.3f}',      # D output on real (ideally 1)
+					'D(G(z))': f'{D_G_z2:.3f}' # D output on fake (ideally 0 initially, then 1 as G improves)
+				})
+
+			# Optionally save intermediate grids every N iterations
+			if args.save_every_iters > 0 and iters % args.save_every_iters == 0:
+				with torch.no_grad():  # No gradients needed for inference
+					fake_fixed = netG(fixed_noise).detach().cpu()
+				save_image(fake_fixed, out_dir / f'iter_{iters:06d}.png', normalize=True, nrow=8)
+
+		# ─────────────────────────────────────────────────────────────────
+		# END OF EPOCH: Save progress images
+		# ─────────────────────────────────────────────────────────────────
+		with torch.no_grad():
+			fake_fixed = netG(fixed_noise).detach().cpu()
+		
+		epoch_file = out_dir / f'epoch_{epoch:03d}.png'
+		save_image(fake_fixed, epoch_file, normalize=True, nrow=8)
+
+		epoch_time = time.time() - epoch_start
+		print(f"Epoch {epoch} finished in {epoch_time:.1f}s — saved {epoch_file}")
+
+	total_time = time.time() - start_time
+	print(f"\n{'='*70}")
+	print(f"Training finished in {total_time:.1f}s ({total_time/60:.1f} minutes)")
+	print(f"{'='*70}\n")
+
+	# Save final model weights for later use
+	print("Saving trained models...")
+	torch.save(netG.state_dict(), 'netG_final.pth')
+	torch.save(netD.state_dict(), 'netD_final.pth')
+	print("✓ Saved netG_final.pth (generator)")
+	print("✓ Saved netD_final.pth (discriminator)")
+	print("\nUse these .pth files to:")
+	print("  - Fine-tune on real medical images")
+	print("  - Generate more synthetic images")
+	print("  - Transfer to other tasks")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMMAND-LINE ARGUMENTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def parse_args():
+	"""
+	Parse and return command-line arguments.
+	
+	HYPERPARAMETERS TO TUNE:
+	========================
+	
+	--epochs: More epochs = longer training, but risk overfitting
+	  - MNIST: 10-30 epochs usually sufficient
+	  - Real images: 100+ epochs common
+	  
+	--batch_size: Larger = faster training but more GPU memory
+	  - Typical: 64, 128, 256
+	  - Start with 128 if unsure
+	  
+	--image_size: Must be power of 2 (32, 64, 128, 256, 512)
+	  - DCGAN assumes careful upsampling
+	  - 64x64 is standard for this architecture
+	  
+	--nz: Noise dimension (higher = more diversity)
+	  - Typical: 100-200
+	  - Higher nz = G has more capacity but may overfit
+	  
+	--ngf/--ndf: Model capacity (higher = better quality but slower)
+	  - Typical: 64, 128, 256
+	  - Start with 64, increase if images look noisy
+	  
+	--lr: Learning rate (smaller = slower but more stable)
+	  - DCGAN paper: 0.0002
+	  - Don't change unless training is unstable
+	  
+	--num_visualize: Grid size for saved images
+	  - Typical: 16, 32, 64
+	  - Display as 8x8 grid = 64 images
+	  
+	--save_every_iters: Save intermediate grids (0 = disable)
+	  - 0: only save at epoch end
+	  - 500: also save every 500 iterations
+	  
+	--log_interval: Print progress how often
+	  - Smaller = more frequent updates
+	"""
+	parser = argparse.ArgumentParser(
+		description='DCGAN demo for medical image synthesis'
+	)
+	
+	parser.add_argument('--dataset', type=str, default='MNIST',
+		help='Dataset: MNIST or FashionMNIST')
+	
+	parser.add_argument('--data_root', type=str, default='./data',
+		help='Path to save/load dataset')
+	
+	parser.add_argument('--epochs', type=int, default=10,
+		help='Number of training epochs')
+	
+	parser.add_argument('--batch_size', type=int, default=128,
+		help='Batch size (samples per iteration)')
+	
+	parser.add_argument('--image_size', type=int, default=64,
+		help='Target image size (power of 2: 32, 64, 128, ...)')
+	
+	parser.add_argument('--nc', type=int, default=1,
+		help='Number of image channels (1=gray, 3=RGB, 5+=multi-modal)')
+	
+	parser.add_argument('--nz', type=int, default=100,
+		help='Noise vector dimension (higher = more diversity)')
+	
+	parser.add_argument('--ngf', type=int, default=64,
+		help='Generator filters (higher = better quality, slower)')
+	
+	parser.add_argument('--ndf', type=int, default=64,
+		help='Discriminator filters (higher = better discrimination)')
+	
+	parser.add_argument('--lr', type=float, default=0.0002,
+		help='Learning rate (DCGAN paper: 0.0002)')
+	
+	parser.add_argument('--num_visualize', type=int, default=64,
+		help='Number of images in visualization grid')
+	
+	parser.add_argument('--save_every_iters', type=int, default=0,
+		help='Save intermediate grids every N iterations (0=disable)')
+	
+	parser.add_argument('--log_interval', type=int, default=100,
+		help='Print progress every N batches')
+	
+	parser.add_argument('--force_cpu', action='store_true',
+		help='Force CPU even if CUDA available')
+	
+	parser.add_argument('--seed', type=int, default=42,
+		help='Random seed for reproducibility')
+	
+	return parser.parse_args()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+	# Parse command-line arguments
+	args = parse_args()
+	
+	# Set random seeds for reproducibility
+	# Even with GPU, setting seeds helps reproduce exact results
+	random.seed(args.seed)
+	torch.manual_seed(args.seed)
+	if torch.cuda.is_available():
+		torch.cuda.manual_seed_all(args.seed)
+
+	# Run training
+	train(args)
+
+	# ═════════════════════════════════════════════════════════════════════
+	# NEXT STEPS & APPLICATIONS
+	# ═════════════════════════════════════════════════════════════════════
+	#
+	# After training:
+	#
+	# 1. INSPECT PROGRESS IMAGES:
+	#    Look at progress_images/epoch_*.png to see if G is learning
+	#    - Epoch 1: random noise (terrible)
+	#    - Mid epochs: blurry structure emerges
+	#    - Late epochs: clear recognizable patterns
+	#
+	# 2. ADAPT TO REAL MEDICAL IMAGES:
+	#    a) Create custom Dataset class for DICOM/medical images
+	#    b) Adjust image_size to match medical image resolution
+	#    c) Normalize properly (e.g., Hounsfield units for CT)
+	#    d) Potentially increase ngf/ndf and nz for complexity
+	#    e) Use progressive training for high-resolution images
+	#
+	# 3. DATA AUGMENTATION:
+	#    a) Load trained netG_final.pth
+	#    b) Generate new noise vectors: z = randn(num_samples, nz, 1, 1)
+	#    c) Create synthetic images: x_fake = netG(z)
+	#    d) Combine with real images for training classification models
+	#    e) Validate with clinicians before use
+	#
+	# 4. CONDITIONAL GENERATION (Advanced):
+	#    Replace DCGAN with cGAN (Conditional GAN)
+	#    - Add disease labels to both G and D
+	#    - E.g., cGAN with "healthy" vs "pneumonia" labels
+	#    - Generate specific pathology types on demand
+	#    - See: pix2pix, CycleGAN for more structured generation
+	#
+	# 5. QUALITY ASSESSMENT:
+	#    - FID (Fréchet Inception Distance): measures realism
+	#    - IS (Inception Score): measures diversity & quality
+	#    - Manual review by radiologists (CRITICAL for medical use)
+	#
+	# IMPORTANT: REGULATORY COMPLIANCE
+	# ==================================
+	# - Generated images are synthetic: label them clearly
+	# - Validate with domain experts before any clinical use
+	# - Follow FDA/CE marking requirements if deploying models
+	# - Respect patient privacy and data governance laws
+	# - Document data provenance and quality metrics
