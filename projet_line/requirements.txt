@@ -1,0 +1,6 @@
+torch>=1.13.0
+torchvision>=0.14.0
+tqdm
+Pillow
+
+# Optional (for GPU): ensure CUDA toolkit and matching torch wheel are installed
