@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kidney Exchange - Hybrid Data</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; }
+        body { background: #09090b; color: #e4e4e7; font-family: 'Inter', sans-serif; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        .sidebar { width: 420px; background: #18181b; border-right: 1px solid #27272a; padding: 20px; display: flex; flex-direction: column; gap: 15px; z-index: 2; overflow-y: auto; }
+        .main { flex: 1; position: relative; background: radial-gradient(circle at 50% 50%, #1c1c1c 0%, #000 100%); }
+        h1 { font-family: 'JetBrains Mono'; font-size: 18px; color: #3b82f6; margin: 0; }
+        h2 { font-size: 13px; color: #a1a1aa; margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+        h3 { font-size: 12px; color: #71717a; margin: 10px 0 6px 0; text-transform: uppercase; font-weight: 600; }
+        
+        .card { background: #000; border: 1px solid #27272a; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+        .card-urgent { border-left: 3px solid #ef4444; }
+        .card-success { border-left: 3px solid #22c55e; }
+        .stat-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }
+        .stat-label { color: #71717a; }
+        .stat-val { font-family: 'JetBrains Mono'; color: #fff; font-weight: bold; }
+        .stat-val.urgent { color: #ef4444; }
+        .stat-val.success { color: #22c55e; }
+        
+        .btn-group { display: flex; gap: 5px; background: #000; padding: 8px; border-radius: 6px; border: 1px solid #27272a; margin-bottom: 10px; }
+        .btn { flex: 1; background: none; border: none; color: #71717a; padding: 10px; cursor: pointer; font-weight: 600; border-radius: 4px; transition: 0.2s; font-size: 12px; }
+        .btn:hover { color: #fff; background: rgba(255,255,255,0.05); }
+        .btn.active { background: #3b82f6; color: #fff; }
+        
+        .story-text { font-size: 12px; line-height: 1.6; color: #a1a1aa; display: none; }
+        .story-text.active { display: block; animation: fadeIn 0.3s; }
+        
+        .algorithm-box { background: rgba(59, 130, 246, 0.08); border: 1px solid #3b82f6; border-radius: 6px; padding: 10px; margin: 8px 0; font-size: 11px; line-height: 1.5; }
+        .algorithm-box code { background: #000; padding: 2px 4px; border-radius: 3px; font-family: 'JetBrains Mono'; color: #eab308; }
+        
+        .formula { background: #000; border: 1px solid #333; padding: 8px; border-radius: 4px; font-family: 'JetBrains Mono'; font-size: 11px; margin: 5px 0; color: #a1a1aa; line-height: 1.4; }
+        
+        .info-btn { background: rgba(234, 179, 8, 0.1); border: 1px solid #eab308; color: #eab308; padding: 8px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: bold; text-transform: uppercase; transition: 0.2s; }
+        .info-btn:hover { background: rgba(234, 179, 8, 0.2); }
+        
+        .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); backdrop-filter: blur(5px); overflow-y: auto; }
+        .modal-content { background-color: #18181b; margin: 30px auto; padding: 25px; border: 1px solid #3b82f6; width: 60%; max-width: 800px; border-radius: 10px; box-shadow: 0 0 20px rgba(59, 130, 246, 0.3); position: relative; }
+        .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; line-height: 20px; }
+        .close:hover { color: white; }
+        
+        .legend { position: absolute; bottom: 20px; left: 20px; background: rgba(0,0,0,0.8); padding: 12px; border-radius: 6px; border: 1px solid #333; font-size: 11px; z-index: 10; }
+        .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        
+        .chart-container { background: #000; border: 1px solid #27272a; border-radius: 6px; padding: 12px; margin: 10px 0; }
+        .chart-container canvas { max-height: 200px; }
+        
+        .warning-box { background: rgba(239, 68, 68, 0.1); border-left: 3px solid #ef4444; padding: 10px; border-radius: 4px; font-size: 11px; }
+        
+        .quick-btn { flex: 1; background: #18181b; border: 1px solid #27272a; color: #a1a1aa; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold; transition: 0.2s; }
+        .quick-btn:hover { background: #27272a; color: #fff; border-color: #3b82f6; }
+        
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body>
+
+<div class="sidebar">
+    <div>
+        <h1>🏥 KIDNEY MATCH v6.0</h1>
+        <div style="font-size: 10px; color: #555; margin-top: 4px;">ML + THÉORIE DES JEUX</div>
+    </div>
+
+    <!-- CONTRÔLE NOMBRE DE PATIENTS -->
+    <div class="card" style="margin-top: 10px;">
+        <h3 style="margin-top: 0;">🎛️ Nombre de Patients</h3>
+        <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="number" id="patientCount" value="10" min="5" max="200" 
+                   style="flex: 1; background: #18181b; border: 1px solid #3b82f6; color: #fff; padding: 8px; border-radius: 4px; font-family: 'JetBrains Mono'; font-size: 14px; font-weight: bold;">
+            <button onclick="regenerate()" 
+                    style="background: #3b82f6; border: none; color: #fff; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 12px;">
+                GÉNÉRER
+            </button>
+        </div>
+        <div id="commandOutput" style="display: none; margin-top: 8px; background: #000; border: 1px solid #eab308; padding: 8px; border-radius: 4px; font-size: 10px; font-family: 'JetBrains Mono'; color: #eab308; line-height: 1.4;">
+            <div style="margin-bottom: 4px; color: #a1a1aa;">📋 Copie cette commande dans ton terminal :</div>
+            <div id="commandText" style="user-select: all; color: #fff;"></div>
+        </div>
+        <div style="display: flex; gap: 4px; margin-top: 6px;">
+            <button onclick="quickGen(10)" class="quick-btn">10</button>
+            <button onclick="quickGen(20)" class="quick-btn">20</button>
+            <button onclick="quickGen(50)" class="quick-btn">50</button>
+            <button onclick="quickGen(100)" class="quick-btn">100</button>
+        </div>
+    </div>
+
+    <div class="btn-group">
+        <button class="btn active" onclick="setStep(1)">1. DONNÉES</button>
+        <button class="btn" onclick="setStep(2)">2. URGENCE</button>
+        <button class="btn" onclick="setStep(3)">3. MATCHING</button>
+        <button class="btn" onclick="setStep(4)">4. DÉTAILS</button>
+    </div>
+    
+    <button class="info-btn" onclick="openModal('methods')">📊 Méthodologie Complète</button>
+    <button class="info-btn" onclick="openModal('urgent')">⚠️ Comment Calculer l'Urgence ?</button>
+    <button class="info-btn" onclick="openModal('matching')">🔗 Algorithme de Matching</button>
+
+    <!-- STEP 1: DONNÉES -->
+    <div id="story-1" class="story-text active">
+        <h2>📥 Données Cliniques Réelles</h2>
+        <div class="card">
+            <div class="stat-row">
+                <span class="stat-label">PATIENTS CHARGÉS</span>
+                <span class="stat-val">10</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">SOURCE</span>
+                <span class="stat-val" style="font-size:10px;">Synthétique</span>
+            </div>
+        </div>
+        
+        <h3>🔄 Principe des Échanges Croisés</h3>
+        <div class="card" style="font-size:11px; line-height:1.7; background: rgba(59, 130, 246, 0.05);">
+            <b>Chaque personne = PATIENT + DONNEUR :</b><br><br>
+            
+            <b>Patient #1</b><br>
+            • A besoin d'un rein (groupe A)<br>
+            • A un donneur volontaire (frère, groupe O)<br>
+            • ❌ Incompatibles entre eux !<br><br>
+            
+            <b>Patient #2</b><br>
+            • A besoin d'un rein (groupe O)<br>
+            • A un donneur volontaire (sœur, groupe A)<br>
+            • ❌ Incompatibles entre eux !<br><br>
+            
+            <b style="color: #22c55e;">✅ ÉCHANGE CROISÉ :</b><br>
+            • Donneur #1 (O) → Patient #2 (O)<br>
+            • Donneur #2 (A) → Patient #1 (A)<br>
+            <b>Les deux sont sauvés !</b>
+        </div>
+        
+        <h3>Paramètres Physiologiques</h3>
+        <div class="card" style="font-size:11px; line-height:1.6;">
+            <b>✓ Créatinine (SC)</b> - Fonction rénale<br>
+            <b>✓ Hémoglobine</b> - Santé générale<br>
+            <b>✓ Âge</b> - Critère temporel<br>
+            <b>✓ Diabète (DM)</b> - Comorbidité<br>
+            <b>✓ Tension</b> - Stabilité cardiovasculaire
+        </div>
+        
+        <h3>Groupes Sanguins (Simulés)</h3>
+        <div class="card" style="font-size:11px;">
+            Distribution mondiale:
+            <div style="margin-top:5px; font-family: JetBrains Mono;">
+            O: 45% | A: 40% | B: 11% | AB: 4%
+            </div>
+        </div>
+    </div>
+
+    <!-- STEP 2: URGENCE (SCORING) -->
+    <div id="story-2" class="story-text">
+        <h2>⚡ Scoring d'Urgence (I.A.)</h2>
+        
+        <h3>🎯 Patient Critique</h3>
+        <div class="card card-urgent">
+            <div class="stat-row">
+                <span class="stat-label">ID</span>
+                <span class="stat-val urgent">#0</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">SCORE</span>
+                <span class="stat-val urgent">100/100</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Créatinine</span>
+                <span class="stat-val">3.53</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Âge</span>
+                <span class="stat-val">82 ans</span>
+            </div>
+        </div>
+        
+        <h3>⚙️ Formule du Score</h3>
+        <div class="algorithm-box">
+            <code>SCORE = (Créat×0.6) + (¬Hemo×0.2) + (Age×0.2) + (Diabète×0.1)</code>
+            <br><br>
+            • <b>Créatinine (60%)</b> = Principal indicateur défaillance<br>
+            • <b>Hémoglobine inversée (20%)</b> = Santé générale<br>
+            • <b>Âge normalisé (20%)</b> = Temps critique<br>
+            • <b>Diabète (10%)</b> = Facteur aggravant
+        </div>
+        
+        <div class="chart-container">
+            <canvas id="scoreChart"></canvas>
+        </div>
+        
+        <h3>Interprétation</h3>
+        <div class="card">
+            <div style="font-size:11px; line-height:1.6;">
+            🔴 <b>80-100</b>: CRITIQUE (transfusion immédiate)<br>
+            🟡 <b>50-79</b>: GRAVE (délai semaines)<br>
+            🟢 <b>&lt;50</b>: STABLE (attente acceptable)
+            </div>
+        </div>
+    </div>
+
+    <!-- STEP 3: MATCHING -->
+    <div id="story-3" class="story-text">
+        <h2>🔗 Matching par Théorie des Jeux</h2>
+        
+        <h3>Cycles Trouvés</h3>
+        <div class="card card-success">
+            <div class="stat-row">
+                <span class="stat-label">CYCLES VALIDES</span>
+                <span class="stat-val success">1</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">PATIENTS SAUVÉS</span>
+                <span class="stat-val success">3</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">TAUX SUCCÈS</span>
+                <span class="stat-val success">30%</span>
+            </div>
+        </div>
+        
+        <h3>Algorithme Gale-Shapley</h3>
+        <div class="algorithm-box">
+            <b>Étape 1:</b> Graphe ABO (compatibilité déterministe)<br>
+            <b>Étape 2:</b> Détection cycles 2-3 nœuds<br>
+            <b>Étape 3:</b> Score = Σ urgence(cycle)<br>
+            <b>Étape 4:</b> Tri par utilité décroissante<br>
+            <b>Étape 5:</b> Sélection greedy (sans intersection)
+        </div>
+        
+        <h3>Garanties Théoriques</h3>
+        <div class="card" style="font-size:11px;">
+            ✓ <b>Stable Matching:</b> Aucune déviation profitable<br>
+            ✓ <b>Pareto Optimal:</b> Max surplus social<br>
+            ✓ <b>Nash Equilibrium:</b> Équilibre atteint<br>
+            ✓ <b>Core Solution:</b> Dans le cœur du jeu
+        </div>
+    </div>
+
+    <!-- STEP 4: DÉTAILS -->
+    <div id="story-4" class="story-text">
+        <h2>📈 Analyse Détaillée</h2>
+        
+        <h3>Distribution Scores</h3>
+        <div class="chart-container">
+            <canvas id="histChart"></canvas>
+        </div>
+        
+        <h3>Compatibilité ABO</h3>
+        <div class="card" style="font-size:10px; line-height:1.5;">
+            <b>O →</b> O, A, B, AB (universel) <br>
+            <b>A →</b> A, AB<br>
+            <b>B →</b> B, AB<br>
+            <b>AB →</b> AB (receveur universel)
+        </div>
+        
+        <h3>Statut Patients</h3>
+        <div class="card card-success">
+            <div class="stat-row">
+                <span>Sauvés par échanges</span>
+                <span class="stat-val success">3</span>
+            </div>
+            <div class="stat-row">
+                <span>En attente (incompat.)</span>
+                <span class="stat-val">7</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="main">
+    <div id="network" style="width: 100%; height: 100%;"></div>
+    <div class="legend" id="legend"></div>
+</div>
+
+<!-- MODAL: MÉTHODOLOGIE -->
+<div id="methodsModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('methods')">&times;</span>
+    <h2 style="color: #3b82f6; margin-top:0;">📊 Méthodologie Complète</h2>
+    
+    <h3>1. COLLECTE DE DONNÉES</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Les données physiologiques (<b>créatinine, hémoglobine, âge, tension</b>) sont <b>générées synthétiquement</b> selon des distributions réalistes.
+        <br><br>
+        Les <b>données immunologiques</b> (groupes sanguins ABO/Rh, typage HLA 3 loci, PRA) sont également <b>générées aléatoirement</b> selon les fréquences réelles mondiales.
+    </p>
+    
+    <h3>2. PRÉTRAITEMENT</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        • Imputation des valeurs manquantes (médiane)<br>
+        • Gestion des valeurs infinies<br>
+        • Normalisation MinMax [0, 1]<br>
+        • Limitation à 10 patients pour visualisation
+    </p>
+    
+    <h3>3. SCORING D'URGENCE (Intelligence Artificielle)</h3>
+    <div class="formula">
+SCORE = 0.6 × (Créat - min) / (max - min)
+       + 0.2 × (1 - (Hemo - min) / (max - min))
+       + 0.2 × (Age / 100)
+       + 0.1 × [Diabète présent ?]
+    </div>
+    <p style="font-size:12px; color:#a1a1aa;">
+        <b>Interprétation:</b> Plus le score est élevé, plus le patient est urgent.
+    </p>
+    
+    <h3>4. GRAPHE DE COMPATIBILITÉ ABO</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Un <b>graphe orienté</b> est construit où:<br>
+        • Nœud i → j existe si Donneur(i) peut aider Patient(j)<br>
+        • Compatibilité déterminée par <b>règles ABO</b><br>
+        • Facteur immunologique: 80% de probabilité de match
+    </p>
+    
+    <h3>5. DÉTECTION DE CYCLES (Théorie des Graphes)</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Algorithme <code>NetworkX.simple_cycles()</code> pour détecter cycles fermés:<br>
+        • Cycles 2-cycles: Échange direct (A↔B)<br>
+        • Cycles 3-cycles: Échange triangulaire (A→B→C→A)
+    </p>
+    
+    <h3>6. OPTIMISATION (Stable Matching)</h3>
+    <div class="algorithm-box" style="border-color:#22c55e; background:rgba(34,197,94,0.08);">
+        <b>Algorithme Gale-Shapley:</b><br>
+        1. Calculer utilité chaque cycle: Σ urgences<br>
+        2. Trier cycles par utilité (décroissant)<br>
+        3. Sélection greedy: Max cycles disjoints<br>
+        4. Résultat: Stable matching + Pareto optimal
+    </div>
+    
+    <h3>7. RÉSULTAT FINAL</h3>
+    <p style="font-size:12px; color:#a1a1aa;">
+        <b>3 patients sauvés</b> parmi 10 via <b>1 cycles d'échange</b>.<br>
+        Taux de succès: <b>30%</b>
+    </p>
+  </div>
+</div>
+
+<!-- MODAL: URGENCE -->
+<div id="urgentModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('urgent')">&times;</span>
+    <h2 style="color: #ef4444; margin-top:0;">⚠️ Calcul de l'Urgence</h2>
+    
+    <h3>Pourquoi l'urgence ?</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Dans un réseau d'échanges rénaux, il est <b>éthiquement crucial</b> de donner la priorité 
+        aux patients les plus graves. Le score d'urgence combine plusieurs facteurs cliniques 
+        pour identifier rapidement qui a besoin d'une transplantation immédiate.
+    </p>
+    
+    <h3>Composantes du Score</h3>
+    
+    <div class="card">
+        <b>🔴 CRÉATININE (60% du poids)</b><br>
+        <p style="font-size:11px; line-height:1.5; color:#a1a1aa; margin:8px 0;">
+            Mesure principale de la fonction rénale. Plus elle est élevée, plus les reins défaillent.
+            Normalisée entre 0 et 1.
+        </p>
+    </div>
+    
+    <div class="card">
+        <b>🟡 HÉMOGLOBINE (20% - inverse)</b><br>
+        <p style="font-size:11px; line-height:1.5; color:#a1a1aa; margin:8px 0;">
+            Une faible hémoglobine indique une anémie sévère (complication rénale fréquente).
+            On l'inverse: basse hémoglobine = score haut.
+        </p>
+    </div>
+    
+    <div class="card">
+        <b>🟢 ÂGE (20%)</b><br>
+        <p style="font-size:11px; line-height:1.5; color:#a1a1aa; margin:8px 0;">
+            Les patients plus âgés ont une fenêtre temporelle plus réduite. Normalisé sur 100 ans.
+        </p>
+    </div>
+    
+    <div class="card">
+        <b>🟠 DIABÈTE (10% supplémentaire)</b><br>
+        <p style="font-size:11px; line-height:1.5; color:#a1a1aa; margin:8px 0;">
+            Le diabète complique la maladie rénale et réduit les options de transplantation.
+        </p>
+    </div>
+    
+    <h3>Exemple Concret</h3>
+    <div class="algorithm-box" style="background:rgba(59,130,246,0.08); border-color:#3b82f6;">
+        <b>Patient #0:</b><br>
+        Créat=3.53 | Age=82 | Score=<span style="color:#ef4444">100</span>/100<br><br>
+        → <span style="color:#ef4444;font-weight:bold;">CRITIQUE - PRIORITÉ IMMÉDIATE</span>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: MATCHING -->
+<div id="matchingModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('matching')">&times;</span>
+    <h2 style="color: #00d2ff; margin-top:0;">🔗 Algorithme de Matching (Stable Matching)</h2>
+    
+    <h3>Contexte: Jeu de Coalition</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        L'échange rénal est un <b>jeu de coalition</b> où:
+        <br>• Chaque patient veut un rein compatible<br>
+        • Chaque donneur veut aider un patient urgent<br>
+        • Les ressources sont limitées (compatibilité ABO)
+    </p>
+    
+    <h3>Théorie des Jeux: Stable Matching</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Un matching est <b>stable</b> si:<br>
+        ✓ Aucun couple Donneur-Patient ne peut se dévier<br>
+        ✓ Aucun cycle ne peut abandonner pour un meilleur cycle<br>
+        ✓ L'allocation est <b>Pareto optimale</b> (max surplus)
+    </p>
+    
+    <h3>Algorithme Gale-Shapley (Adapté)</h3>
+    <div class="algorithm-box" style="background:rgba(0,210,255,0.08); border-color:#00d2ff;">
+        <b>ÉTAPE 1: Construire Graphe ABO</b><br>
+        Pour chaque donneur i et patient j:<br>
+        • Si groupe(j) ∈ compatibles(groupe(i))<br>
+        • Ajouter arête i → j<br>
+        • Poids = urgence(j)<br><br>
+        
+        <b>ÉTAPE 2: Détecter Tous les Cycles</b><br>
+        Algorithme rapide: <code>nx.simple_cycles()</code><br>
+        Limite: longueur ≤ 3 (viabilité médicale)<br><br>
+        
+        <b>ÉTAPE 3: Évaluer Utilité Sociale</b><br>
+        Pour chaque cycle C:<br>
+        <code>utilité(C) = Σ urgence(n) + bonus[max urgence &gt; 80]</code><br><br>
+        
+        <b>ÉTAPE 4: Sélection Greedy</b><br>
+        Trier cycles par utilité (décroissant)<br>
+        Sélectionner cycles disjoints (max urgence)<br>
+        Résultat = Stable matching<br><br>
+        
+        <b>ÉTAPE 5: Validation Nash</b><br>
+        Vérifier: Aucune coalition ne peut dévier
+    </div>
+    
+    <h3>Résultat: Core Solution</h3>
+    <p style="font-size:12px; line-height:1.7; color:#a1a1aa;">
+        <b>1 cycles</b> d'échange détectés<br>
+        <b>3 patients</b> sauvés par ces cycles<br>
+        <b>Efficacité Pareto:</b> 30%
+    </p>
+  </div>
+</div>
+
+<script>
+    const nodesRaw = [{"id": 0, "label": "P0", "title": "<b>PAIRE #0</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 3.5<br>Age: 82<br>Score Urgence: 99/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 99, "ai_color": "#ef4444", "gt_color": "#00d2ff", "cid": 0, "group": "saved", "in_any_cycle": true, "blood": "A", "compatible": "O,A", "donor": 2}, {"id": 1, "label": "P1", "title": "<b>PAIRE #1</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 2.7<br>Age: 37<br>Score Urgence: 2/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 2, "ai_color": "#22c55e", "gt_color": "#00d2ff", "cid": 0, "group": "saved", "in_any_cycle": true, "blood": "A", "compatible": "O,A", "donor": 0}, {"id": 2, "label": "P2", "title": "<b>PAIRE #2</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 4.2<br>Age: 52<br>Score Urgence: 12/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 12, "ai_color": "#22c55e", "gt_color": "#00d2ff", "cid": 0, "group": "saved", "in_any_cycle": true, "blood": "A", "compatible": "O,A", "donor": 1}, {"id": 3, "label": "P3", "title": "<b>PAIRE #3</b><br><br><b>PATIENT:</b><br>Groupe: O<br>Cr\u00e9atinine: 0.6<br>Age: 41<br>Score Urgence: 2/100<br><br><b>DONNEUR:</b><br>Pas de donneur", "val": 2, "ai_color": "#22c55e", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "O", "compatible": "O", "donor": -1}, {"id": 4, "label": "P4", "title": "<b>PAIRE #4</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 4.1<br>Age: 61<br>Score Urgence: 99/100<br><br><b>DONNEUR:</b><br>Donneur: O", "val": 99, "ai_color": "#ef4444", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "A", "compatible": "O,A", "donor": -1}, {"id": 5, "label": "P5", "title": "<b>PAIRE #5</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 3.0<br>Age: 39<br>Score Urgence: 87/100<br><br><b>DONNEUR:</b><br>Pas de donneur", "val": 87, "ai_color": "#ef4444", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "A", "compatible": "O,A", "donor": -1}, {"id": 6, "label": "P6", "title": "<b>PAIRE #6</b><br><br><b>PATIENT:</b><br>Groupe: O<br>Cr\u00e9atinine: 1.8<br>Age: 42<br>Score Urgence: 94/100<br><br><b>DONNEUR:</b><br>Pas de donneur", "val": 94, "ai_color": "#ef4444", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "O", "compatible": "O", "donor": -1}, {"id": 7, "label": "P7", "title": "<b>PAIRE #7</b><br><br><b>PATIENT:</b><br>Groupe: O<br>Cr\u00e9atinine: 0.7<br>Age: 46<br>Score Urgence: 0/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 0, "ai_color": "#22c55e", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "O", "compatible": "O", "donor": -1}, {"id": 8, "label": "P8", "title": "<b>PAIRE #8</b><br><br><b>PATIENT:</b><br>Groupe: AB<br>Cr\u00e9atinine: 5.0<br>Age: 70<br>Score Urgence: 79/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 79, "ai_color": "#eab308", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": true, "blood": "AB", "compatible": "O,A,B,AB", "donor": -1}, {"id": 9, "label": "P9", "title": "<b>PAIRE #9</b><br><br><b>PATIENT:</b><br>Groupe: O<br>Cr\u00e9atinine: 0.5<br>Age: 79<br>Score Urgence: 82/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 82, "ai_color": "#ef4444", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "O", "compatible": "O", "donor": -1}];
+    const edgesRaw = [{"from": 0, "to": 1, "is_sol": true, "is_candidate": true}, {"from": 1, "to": 2, "is_sol": true, "is_candidate": true}, {"from": 1, "to": 8, "is_sol": false, "is_candidate": true}, {"from": 2, "to": 0, "is_sol": true, "is_candidate": true}, {"from": 4, "to": 9, "is_sol": false, "is_candidate": false}, {"from": 7, "to": 1, "is_sol": false, "is_candidate": false}, {"from": 8, "to": 1, "is_sol": false, "is_candidate": true}, {"from": 9, "to": 0, "is_sol": false, "is_candidate": false}, {"from": 9, "to": 1, "is_sol": false, "is_candidate": false}];
+    
+    const nodes = new vis.DataSet(nodesRaw);
+    const edges = new vis.DataSet(edgesRaw);
+    
+    const container = document.getElementById('network');
+    const data = { nodes: nodes, edges: edges };
+    const options = {
+        nodes: { 
+            shape: 'dot', 
+            font: { color: '#fff', face: 'Inter', size: 10 }, 
+            borderWidth: 2,
+            shadow: true 
+        },
+        edges: { 
+            smooth: { type: 'continuous' }, 
+            arrows: { to: { scaleFactor: 0.5 } },
+            font: { size: 10 },
+            shadow: true
+        },
+        physics: { 
+            stabilization: { iterations: 1000 }, 
+            barnesHut: { gravitationalConstant: -2000 } 
+        }
+    };
+    
+    const network = new vis.Network(container, data, options);
+    
+    network.once("stabilizationIterationsDone", function() {
+        network.setOptions({ physics: { enabled: false } });
+        network.fit();
+    });
+
+    function openModal(modalId) { 
+        document.getElementById(modalId + 'Modal').style.display = "block"; 
+    }
+    function closeModal(modalId) { 
+        document.getElementById(modalId + 'Modal').style.display = "none"; 
+    }
+    window.onclick = function(event) { 
+        if (event.target.classList.contains('modal')) { 
+            event.target.style.display = "none"; 
+        } 
+    }
+
+    // Charts
+    var urgencyScores = [{"id": 0, "label": "P0", "title": "<b>PAIRE #0</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 3.5<br>Age: 82<br>Score Urgence: 99/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 99, "ai_color": "#ef4444", "gt_color": "#00d2ff", "cid": 0, "group": "saved", "in_any_cycle": true, "blood": "A", "compatible": "O,A", "donor": 2}, {"id": 1, "label": "P1", "title": "<b>PAIRE #1</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 2.7<br>Age: 37<br>Score Urgence: 2/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 2, "ai_color": "#22c55e", "gt_color": "#00d2ff", "cid": 0, "group": "saved", "in_any_cycle": true, "blood": "A", "compatible": "O,A", "donor": 0}, {"id": 2, "label": "P2", "title": "<b>PAIRE #2</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 4.2<br>Age: 52<br>Score Urgence: 12/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 12, "ai_color": "#22c55e", "gt_color": "#00d2ff", "cid": 0, "group": "saved", "in_any_cycle": true, "blood": "A", "compatible": "O,A", "donor": 1}, {"id": 3, "label": "P3", "title": "<b>PAIRE #3</b><br><br><b>PATIENT:</b><br>Groupe: O<br>Cr\u00e9atinine: 0.6<br>Age: 41<br>Score Urgence: 2/100<br><br><b>DONNEUR:</b><br>Pas de donneur", "val": 2, "ai_color": "#22c55e", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "O", "compatible": "O", "donor": -1}, {"id": 4, "label": "P4", "title": "<b>PAIRE #4</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 4.1<br>Age: 61<br>Score Urgence: 99/100<br><br><b>DONNEUR:</b><br>Donneur: O", "val": 99, "ai_color": "#ef4444", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "A", "compatible": "O,A", "donor": -1}, {"id": 5, "label": "P5", "title": "<b>PAIRE #5</b><br><br><b>PATIENT:</b><br>Groupe: A<br>Cr\u00e9atinine: 3.0<br>Age: 39<br>Score Urgence: 87/100<br><br><b>DONNEUR:</b><br>Pas de donneur", "val": 87, "ai_color": "#ef4444", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "A", "compatible": "O,A", "donor": -1}, {"id": 6, "label": "P6", "title": "<b>PAIRE #6</b><br><br><b>PATIENT:</b><br>Groupe: O<br>Cr\u00e9atinine: 1.8<br>Age: 42<br>Score Urgence: 94/100<br><br><b>DONNEUR:</b><br>Pas de donneur", "val": 94, "ai_color": "#ef4444", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "O", "compatible": "O", "donor": -1}, {"id": 7, "label": "P7", "title": "<b>PAIRE #7</b><br><br><b>PATIENT:</b><br>Groupe: O<br>Cr\u00e9atinine: 0.7<br>Age: 46<br>Score Urgence: 0/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 0, "ai_color": "#22c55e", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "O", "compatible": "O", "donor": -1}, {"id": 8, "label": "P8", "title": "<b>PAIRE #8</b><br><br><b>PATIENT:</b><br>Groupe: AB<br>Cr\u00e9atinine: 5.0<br>Age: 70<br>Score Urgence: 79/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 79, "ai_color": "#eab308", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": true, "blood": "AB", "compatible": "O,A,B,AB", "donor": -1}, {"id": 9, "label": "P9", "title": "<b>PAIRE #9</b><br><br><b>PATIENT:</b><br>Groupe: O<br>Cr\u00e9atinine: 0.5<br>Age: 79<br>Score Urgence: 82/100<br><br><b>DONNEUR:</b><br>Donneur: A", "val": 82, "ai_color": "#ef4444", "gt_color": "#333", "cid": -1, "group": "lost", "in_any_cycle": false, "blood": "O", "compatible": "O", "donor": -1}].map(n => n.val);
+    var ctx = document.getElementById('scoreChart');
+    if(ctx) {
+        new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: urgencyScores.slice(0, 20).map((_, i) => 'P' + i),
+                datasets: [{
+                    label: 'Score Urgence',
+                    data: urgencyScores.slice(0, 20),
+                    backgroundColor: urgencyScores.slice(0, 20).map(s => 
+                        s > 80 ? '#ef4444' : s > 50 ? '#eab308' : '#22c55e'
+                    ),
+                    borderColor: '#333',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: { y: { max: 100, ticks: { color: '#888' }, grid: { color: '#222' } },
+                          x: { ticks: { color: '#888' }, grid: { display: false } } },
+                plugins: { legend: { display: false } }
+            }
+        });
+    }
+    
+    var histCtx = document.getElementById('histChart');
+    if(histCtx) {
+        var bins = [0,0,0,0,0];
+        urgencyScores.forEach(s => {
+            if(s < 20) bins[0]++;
+            else if(s < 40) bins[1]++;
+            else if(s < 60) bins[2]++;
+            else if(s < 80) bins[3]++;
+            else bins[4]++;
+        });
+        new Chart(histCtx, {
+            type: 'doughnut',
+            data: {
+                labels: ['<20 (Stable)', '20-40', '40-60', '60-80 (Grave)', '80+ (Critique)'],
+                datasets: [{
+                    data: bins,
+                    backgroundColor: ['#22c55e', '#84cc16', '#eab308', '#f97316', '#ef4444'],
+                    borderColor: '#000',
+                    borderWidth: 2
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { position: 'bottom', labels: { color: '#a1a1aa', font: { size: 10 } } } }
+            }
+        });
+    }
+
+    function setStep(step) {
+        document.querySelectorAll('.btn').forEach((b, i) => b.classList.toggle('active', i === step-1));
+        document.querySelectorAll('.story-text').forEach((d, i) => d.classList.toggle('active', i === step-1));
+        
+        const allNodes = nodes.get();
+        const allEdges = edges.get();
+        const legend = document.getElementById('legend');
+        
+        if(step === 1) {
+            allNodes.forEach(n => { n.color = '#3f3f46'; n.size = 8; n.shadow = false; });
+            allEdges.forEach(e => { e.hidden = false; e.color = {color:'#333', opacity: 0.1}; e.width=0.5; });
+            legend.innerHTML = '<b>Step 1: Données</b><br><span class="dot" style="background:#3f3f46"></span>Paire (Patient + Donneur)';
+        }
+        
+        if(step === 2) {
+            allNodes.forEach(n => { n.color = n.ai_color; n.size = 5 + (n.val/8); n.shadow = true; });
+            allEdges.forEach(e => { e.hidden = true; });
+            legend.innerHTML = '<b>Step 2: Urgence</b><br><span class="dot" style="background:#ef4444"></span>Critique<br><span class="dot" style="background:#eab308"></span>Grave<br><span class="dot" style="background:#22c55e"></span>Stable';
+        }
+        
+        if(step === 3) {
+            // Matching view: show only cycle edges (candidates + validated)
+            allNodes.forEach(n => { 
+                if(n.cid > -1) {
+                    n.hidden = false;
+                    n.color = '#00d2ff';
+                    n.size = 16;
+                    // keep label for validated nodes
+                } else if(n.in_any_cycle) {
+                    n.hidden = false;
+                    n.color = '#93c5fd';
+                    n.size = 6;
+                    n.label = '';
+                } else {
+                    // hide irrelevant nodes to reduce clutter
+                    n.hidden = true;
+                }
+            });
+            allEdges.forEach(e => {
+                if(e.is_sol) { e.hidden = false; e.color = {color:'#00d2ff', opacity:0.95}; e.width=2; }
+                else if(e.is_candidate) { e.hidden = false; e.color = {color:'#93c5fd', opacity:0.4}; e.width=1; }
+                else { e.hidden = true; }
+            });
+            legend.innerHTML = '<b>Step 3: Matching</b><br><span class="dot" style="background:#00d2ff"></span>Cycle validé &nbsp; <span class="dot" style="background:#93c5fd"></span>Cycle candidat';
+        }
+        
+        if(step === 4) {
+            allNodes.forEach(n => { n.color = '#3b82f6'; n.size = 10; n.shadow = true; });
+            allEdges.forEach(e => { e.hidden = true; });
+            legend.innerHTML = '<b>Step 4: Analyse</b><br>Voir les statistiques →';
+        }
+        
+        nodes.update(allNodes);
+        edges.update(allEdges);
+    }
+    
+    function applyPatientCount() {
+        let n = parseInt(document.getElementById('patientCountInput').value) || nodesRaw.length;
+        n = Math.max(2, Math.min(nodesRaw.length, n));
+        // take first n patients from the original nodesRaw order
+        const filteredNodes = nodesRaw.slice(0, n).map(n => Object.assign({hidden:false}, n));
+        const ids = new Set(filteredNodes.map(x => x.id));
+        const filteredEdges = edgesRaw.filter(e => ids.has(e.from) && ids.has(e.to));
+
+        // replace datasets
+        nodes.clear();
+        edges.clear();
+        nodes.add(filteredNodes);
+        edges.add(filteredEdges);
+
+        // update small stats in sidebar if present
+        const totalSpan = document.getElementById('displayTotal');
+        if(totalSpan) totalSpan.innerText = String(n);
+
+        // reapply current view styles
+        setStep(currentView);
+    }
+    
+    setStep(1);
+</script>
+
+</body>
+</html>

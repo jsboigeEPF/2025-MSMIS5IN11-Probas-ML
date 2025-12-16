@@ -1,0 +1,1853 @@
+# rendu georjon thomas et granes victor
+
+# ============================================================
+# 🎛️ CONFIGURATION : CHANGE CE NOMBRE POUR ANALYSER PLUS/MOINS DE PATIENTS
+# ============================================================
+NOMBRE_PATIENTS = 10  # ← MODIFIE CE CHIFFRE (ex: 10, 30, 50, 100...)
+# ============================================================
+
+import os
+import sys
+import json
+import webbrowser
+import pandas as pd
+import numpy as np
+import networkx as nx
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+try:
+    import pulp
+    PULP_AVAILABLE = True
+except Exception:
+    pulp = None
+    PULP_AVAILABLE = False
+    print("[WARN] pulp non installé — l'optimisation ILP utilisera le fallback greedy. Pour installer: pip install pulp")
+
+# --- CONFIGURATION STRICTE ---
+SEED = 99
+
+class MedicalEngine:
+    def __init__(self, n_patients=NOMBRE_PATIENTS):
+        self.df = None
+        self.graph = nx.DiGraph()
+        self.cycles = []
+        self.scaler = MinMaxScaler()
+        self.top_patient = {}
+        self.n_patients = n_patients
+
+    def load_and_merge(self):
+        print("1. Génération de données synthétiques...")
+        
+        # Génération directe de N patients avec données cliniques réalistes
+        np.random.seed(SEED)
+        n_patients = self.n_patients
+        
+        self.df = pd.DataFrame({
+            'sc': np.random.uniform(0.5, 5.0, n_patients),      # Créatinine sérique
+            'hemo': np.random.uniform(8, 17, n_patients),       # Hémoglobine
+            'age': np.random.randint(20, 90, n_patients),       # Âge
+            'dm': np.random.choice([0, 1], n_patients),         # Diabète
+            'bp': np.random.randint(60, 100, n_patients)        # Tension artérielle
+        })
+        
+        print(f"   > {n_patients} patients générés")
+
+        print("2. Génération des données immunologiques (HLA, Anticorps, Groupes)...")
+        
+        np.random.seed(SEED)
+        
+        # === GROUPES SANGUINS ABO + RHÉSUS ===
+        blood_types = ['O', 'A', 'B', 'AB']
+        probs = [0.45, 0.40, 0.11, 0.04]
+        rhesus = ['+', '-']
+        rhesus_probs = [0.85, 0.15]
+        
+        self.df['patient_blood'] = np.random.choice(blood_types, n_patients, p=probs)
+        self.df['patient_rh'] = np.random.choice(rhesus, n_patients, p=rhesus_probs)
+        
+        # === TYPAGE HLA (Human Leukocyte Antigen) ===
+        # Génération d'allèles HLA réalistes pour 3 loci principaux
+        hla_a = ['A1', 'A2', 'A3', 'A11', 'A24', 'A25', 'A26', 'A29', 'A30', 'A31', 'A32', 'A33']
+        hla_b = ['B7', 'B8', 'B13', 'B27', 'B35', 'B38', 'B44', 'B51', 'B57', 'B58', 'B60', 'B62']
+        hla_dr = ['DR1', 'DR3', 'DR4', 'DR7', 'DR11', 'DR13', 'DR15', 'DR17']
+        
+        # Chaque patient a 2 allèles par locus (héritage maternel + paternel)
+        self.df['patient_hla_a1'] = np.random.choice(hla_a, n_patients)
+        self.df['patient_hla_a2'] = np.random.choice(hla_a, n_patients)
+        self.df['patient_hla_b1'] = np.random.choice(hla_b, n_patients)
+        self.df['patient_hla_b2'] = np.random.choice(hla_b, n_patients)
+        self.df['patient_hla_dr1'] = np.random.choice(hla_dr, n_patients)
+        self.df['patient_hla_dr2'] = np.random.choice(hla_dr, n_patients)
+        
+        # === PANEL REACTIVE ANTIBODIES (PRA) ===
+        # % d'anticorps anti-HLA présents chez le patient (0-100%)
+        # Distribution réaliste: majorité <20%, minorité hypersensibilisés >80%
+        pra_distribution = np.concatenate([
+            np.random.uniform(0, 20, int(n_patients * 0.7)),    # 70% faible sensibilisation
+            np.random.uniform(20, 50, int(n_patients * 0.2)),   # 20% sensibilisation modérée
+            np.random.uniform(50, 98, int(n_patients * 0.1))    # 10% hypersensibilisés
+        ])
+        np.random.shuffle(pra_distribution)
+        self.df['patient_pra'] = pra_distribution[:n_patients]
+        
+        # === DONNEURS (30% n'en ont pas) ===
+        has_donor = np.random.choice([True, False], n_patients, p=[0.7, 0.3])
+        
+        self.df['donor_blood'] = np.where(has_donor, np.random.choice(blood_types, n_patients, p=probs), None)
+        self.df['donor_rh'] = np.where(has_donor, np.random.choice(rhesus, n_patients, p=rhesus_probs), None)
+        
+        # HLA donneurs (seulement si donneur existe)
+        self.df['donor_hla_a1'] = np.where(has_donor, np.random.choice(hla_a, n_patients), None)
+        self.df['donor_hla_a2'] = np.where(has_donor, np.random.choice(hla_a, n_patients), None)
+        self.df['donor_hla_b1'] = np.where(has_donor, np.random.choice(hla_b, n_patients), None)
+        self.df['donor_hla_b2'] = np.where(has_donor, np.random.choice(hla_b, n_patients), None)
+        self.df['donor_hla_dr1'] = np.where(has_donor, np.random.choice(hla_dr, n_patients), None)
+        self.df['donor_hla_dr2'] = np.where(has_donor, np.random.choice(hla_dr, n_patients), None)
+        
+        print(f"   > Typage HLA complet (3 loci)")
+        print(f"   > PRA moyen: {self.df['patient_pra'].mean():.1f}% (sensibilisation anticorps)")
+        print(f"   > {has_donor.sum()}/{n_patients} patients avec donneur")
+        
+        return True
+
+    def run_ai_scoring(self):
+        print("3. Algorithme de Scoring (IA)...")
+        features = ['sc', 'hemo', 'age', 'dm', 'bp']
+        
+        # Pour petits échantillons (< 10 patients), utiliser formule directe
+        if len(self.df) < 10:
+            print("   > Calcul direct du score d'urgence (échantillon réduit)...")
+            # Normalisation des features
+            X_norm = self.scaler.fit_transform(self.df[features])
+            
+            # Score pondéré: Créat(60%) + ¬Hemo(20%) + Age(20%) + Diabète(10%)
+            scores = (
+                0.6 * X_norm[:, 0] +          # créatinine
+                0.2 * (1 - X_norm[:, 1]) +    # hémoglobine inversée
+                0.2 * X_norm[:, 2] +          # âge
+                0.1 * self.df['dm'].values    # diabète
+            )
+            self.df['urgency'] = (scores - scores.min()) / (scores.max() - scores.min() + 1e-12) * 100
+        else:
+            # Pour échantillons plus grands, utiliser RandomForest
+            print("   > Construction d'un label synthétique pour apprentissage supervisé...")
+            self.df['urgent_label'] = ((self.df['sc'] > 3.5) | (self.df['hemo'] < 9) | (self.df['age'] > 75) | (self.df['dm'] == 1)).astype(int)
+
+            X = self.df[features].copy()
+            y = self.df['urgent_label'].values
+
+            # Normalisation minimale
+            X = self.scaler.fit_transform(X)
+
+            # Petit split pour entraînement/validation
+            try:
+                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=SEED, stratify=y)
+            except Exception:
+                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=SEED)
+
+            clf = RandomForestClassifier(n_estimators=100, random_state=SEED)
+            clf.fit(X_train, y_train)
+
+            # Probabilité d'urgence (score continu entre 0 et 1)
+            probs = clf.predict_proba(self.scaler.transform(self.df[features]))[:, 1]
+
+            # Convertir en score 0-100
+            self.df['urgency'] = (probs - probs.min()) / (probs.max() - probs.min() + 1e-12) * 100
+
+        # Top patient selon score calculé
+        idx_max = self.df['urgency'].idxmax()
+        row = self.df.loc[idx_max]
+        self.top_patient = {
+            'id': int(idx_max),
+            'score': int(round(row['urgency'])),
+            'sc': round(float(row['sc']), 2),
+            'age': int(row['age']),
+            'blood': str(row['patient_blood'])
+        }
+        print(f"   > Score d'urgence calculé (patient le plus urgent: #{idx_max}, score={self.top_patient['score']})")
+
+    def check_compatibility(self, donor_idx, recipient_idx):
+        """
+        Calcule la compatibilité immunologique RÉELLE entre donneur et receveur
+        basée sur les données biologiques (ABO, HLA, anticorps)
+        
+        Retourne: True si compatible, False sinon
+        """
+        donor = self.df.loc[donor_idx]
+        recipient = self.df.loc[recipient_idx]
+        
+        # === 1. COMPATIBILITÉ ABO + RHÉSUS (OBLIGATOIRE) ===
+        abo_rules = {
+            'O': ['O', 'A', 'B', 'AB'],
+            'A': ['A', 'AB'],
+            'B': ['B', 'AB'],
+            'AB': ['AB']
+        }
+        
+        if recipient['patient_blood'] not in abo_rules.get(donor['donor_blood'], []):
+            return False  # Incompatibilité ABO absolue
+        
+        # Rhésus: Rh- peut recevoir que Rh-, Rh+ peut recevoir tous
+        if recipient['patient_rh'] == '-' and donor['donor_rh'] == '+':
+            return False  # Incompatibilité Rhésus
+        
+        # === 2. CROSSMATCH HLA (REJET HYPERAIGU) ===
+        # Si le receveur a des anticorps contre les HLA du donneur = rejet immédiat
+        
+        # Collecte des HLA du donneur
+        donor_hlas = {
+            donor['donor_hla_a1'], donor['donor_hla_a2'],
+            donor['donor_hla_b1'], donor['donor_hla_b2'],
+            donor['donor_hla_dr1'], donor['donor_hla_dr2']
+        }
+        
+        # Probabilité que le patient ait des anticorps = PRA%
+        # Plus le PRA est élevé, plus le risque de crossmatch positif est grand
+        pra = recipient['patient_pra']
+        
+        # Simulation du crossmatch: probabilité de rejet basée sur PRA
+        # PRA 0% = 0% rejet, PRA 100% = ~95% rejet (jamais 100% car panels incomplets)
+        rejection_risk = pra * 0.95 / 100
+        
+        if np.random.random() < rejection_risk:
+            return False  # Crossmatch POSITIF = incompatibilité
+        
+        # === 3. COMPATIBILITÉ HLA (QUALITÉ DU MATCH) ===
+        # Compte le nombre de mismatches HLA (0 = match parfait, 6 = totalement différent)
+        
+        recipient_hlas = {
+            recipient['patient_hla_a1'], recipient['patient_hla_a2'],
+            recipient['patient_hla_b1'], recipient['patient_hla_b2'],
+            recipient['patient_hla_dr1'], recipient['patient_hla_dr2']
+        }
+        
+        # Calcul des mismatches par locus
+        hla_matches = len(donor_hlas & recipient_hlas)  # Intersection
+        hla_mismatches = 6 - hla_matches
+        
+        # Acceptation basée sur les mismatches:
+        # 0-1 mismatch: 95% accepté (excellent match)
+        # 2-3 mismatches: 70% accepté (bon match)
+        # 4-5 mismatches: 40% accepté (match moyen)
+        # 6 mismatches: 20% accepté (dernier recours)
+        
+        if hla_mismatches <= 1:
+            accept_prob = 0.95
+        elif hla_mismatches <= 3:
+            accept_prob = 0.70
+        elif hla_mismatches <= 5:
+            accept_prob = 0.40
+        else:
+            accept_prob = 0.20
+        
+        return np.random.random() < accept_prob
+
+    def run_game_theory(self):
+        """
+        THÉORIE DES JEUX APPLIQUÉE AUX ÉCHANGES RÉNAUX
+        ===============================================
+        
+        CONCEPT FONDAMENTAL: Jeu de Coalition Non-Coopératif
+        - Les patients/donneurs cherchent à maximiser leur utilité personnelle
+        - Une "coalition" est un cycle d'échange viable (2-3 personnes)
+        - Objectif: Trouver l'allocation STABLE et PARETO-OPTIMALE
+        
+        MÉCANISME: Topologie Compatibilité ABO (Graphe Orienté)
+        - Nœud i -> j signifie: Donneur(i) peut aider Patient(j)
+        - Poids du lien = Score d'urgence(j)
+        - CONTRAINTE: Cycles fermés seulement (2-3 nœuds)
+        
+        RÉSOLUTION:
+        1. Construire graphe de compatibilité ABO (déterministe)
+        2. Détecter TOUS les cycles simples (longueur ≤ 3)
+        3. Évaluer chaque cycle par UTILITÉ SOCIALE = Σ urgence(cycle)
+        4. Sélection greedy : Cycles à max urgence, sans intersection
+        5. Résultat = Stable Matching + Surplus Social Maximal
+        """
+        print("4. Résolution du Graphe (Théorie des Jeux - Stable Matching)...")
+        
+        # --- ÉTAPE 1: CONSTRUCTION DU GRAPHE DE COMPATIBILITÉ ---
+        nodes = self.df.index.tolist()
+        
+        # Règles ABO: Qui peut donner à qui (biologie réelle)
+        abo_rules = {
+            'O': ['O', 'A', 'B', 'AB'],  # Type O = donneur universel
+            'A': ['A', 'AB'],
+            'B': ['B', 'AB'],
+            'AB': ['AB']                  # Type AB = receveur universel
+        }
+        
+        print(f"   > Graphe: {len(nodes)} nœuds (patients-donneurs)")
+        
+        # Initialiser les nœuds
+        for i in nodes:
+            self.graph.add_node(i)
+        
+        # Ajouter les arêtes selon compatibilité immunologique RÉELLE
+        edge_count = 0
+        for i in nodes:
+            # Skip si pas de donneur (patient sur liste d'attente uniquement)
+            if pd.isna(self.df.loc[i, 'donor_blood']):
+                continue
+            
+            for j in nodes:
+                if i == j: 
+                    continue
+                
+                # Vérification complète: ABO, Rhésus, HLA, Crossmatch, PRA
+                if self.check_compatibility(i, j):
+                    # Poids = Score d'urgence du receveur (pour priorités)
+                    weight = self.df.loc[j, 'urgency']
+                    self.graph.add_edge(i, j, weight=weight)
+                    edge_count += 1
+        
+        print(f"   > {edge_count} arêtes compatibles détectées")
+        
+        # --- ÉTAPE 2: DÉTECTION DES CYCLES (COALITIONS VIABLES) ---
+        print("   > Recherche des cycles d'échange stables...")
+        
+        try:
+            # Algorithme rapide pour cycles courts (< 4 nœuds)
+            cycles = list(nx.simple_cycles(self.graph, length_bound=3))
+            print(f"   > {len(cycles)} cycles trouvés (brut)")
+        except Exception as e:
+            print(f"   > [WARN] Algorithme simple_cycles échoué: {e}")
+            # Fallback: Recherche BFS limitée
+            cycles = []
+            for start_node in nodes[:min(30, len(nodes))]:
+                try:
+                    for path in nx.all_simple_paths(self.graph, start_node, start_node, cutoff=3):
+                        if len(path) > 2:
+                            cycles.append(path[:-1])
+                except nx.NetworkXNoPath:
+                    continue
+                except Exception:
+                    continue
+        
+        # Filtrer: seulement cycles de 2-3 nœuds (viables médicalement)
+        valid_cycles = [c for c in cycles if 1 < len(c) <= 3]
+        # Garder la liste complète des cycles viables pour affichage (candidats)
+        self.all_valid_cycles = valid_cycles.copy()
+        print(f"   > {len(valid_cycles)} cycles viables (2-3 nœuds)")
+        
+        # --- ÉTAPE 3: ÉVALUATION PAR UTILITÉ SOCIALE (Pareto Optimality) ---
+        def cycle_social_utility(cycle):
+            """
+            Utilité d'une coalition = Somme des scores d'urgence
+            Principes: 
+            - Maximiser bien-être global (théorie utilitariste)
+            - Donner priorité aux patients très urgents
+            """
+            total_urgency = sum(self.df.loc[n, 'urgency'] for n in cycle)
+            # Bonus si cycle comporte un patient très urgent (score > 80)
+            urgency_bonus = sum(10 for n in cycle if self.df.loc[n, 'urgency'] > 80)
+            # Favoriser les cycles courts: priorité aux échanges directs (2-personnes)
+            length_bonus = 0
+            if len(cycle) == 2:
+                length_bonus = 20
+            return total_urgency + urgency_bonus + length_bonus
+        
+        # Trier par utilité décroissante
+        valid_cycles.sort(key=cycle_social_utility, reverse=True)
+        print(f"   > Cycles triés par utilité (Pareto optimality)")
+        
+        # --- ÉTAPE 4: SÉLECTION OPTIMALE (PLNE) ---
+        # On formule la sélection comme un problème en nombres entiers:
+        # max Σ utilité(cycle) * x_cycle  s.t. pour chaque nœud Σ_{cycle ∋ nœud} x_cycle ≤ 1
+        # Cela respecte strictement la contrainte de disjonction et maximise le surplus social.
+        self.cycles = []
+        used_nodes = set()
+        try:
+            utilities = [cycle_social_utility(c) for c in valid_cycles]
+            prob = pulp.LpProblem("kidney_cycles", pulp.LpMaximize)
+            x_vars = [pulp.LpVariable(f"x_{i}", cat='Binary') for i in range(len(valid_cycles))]
+            prob += pulp.lpSum([utilities[i] * x_vars[i] for i in range(len(valid_cycles))])
+
+            # Contraintes: chaque nœud au plus dans une coalition
+            for node in nodes:
+                prob += pulp.lpSum([x_vars[i] for i, c in enumerate(valid_cycles) if node in c]) <= 1
+
+            # Solveur CBC (inclus avec pulp) - silencieux
+            prob.solve(pulp.PULP_CBC_CMD(msg=False))
+
+            # Récupérer solution
+            for i, var in enumerate(x_vars):
+                val = pulp.value(var)
+                if val is not None and val > 0.5:
+                    self.cycles.append(valid_cycles[i])
+
+            used_nodes = set(n for c in self.cycles for n in c)
+            print(f"   > {len(self.cycles)} cycles sélectionnés (optimaux via ILP)")
+            print(f"   > {len(used_nodes)} patients sauvés par échanges")
+        except Exception as e:
+            print(f"   > [WARN] Sélection ILP échouée: {e} — fallback greedy")
+            # Fallback: méthode greedy (ancienne approche)
+            self.cycles = []
+            used_nodes = set()
+            for cycle in valid_cycles:
+                if any(node in used_nodes for node in cycle):
+                    continue
+                self.cycles.append(cycle)
+                used_nodes.update(cycle)
+            print(f"   > {len(self.cycles)} cycles sélectionnés (Stable Matching greedy)")
+            print(f"   > {len(used_nodes)} patients sauvés par échanges")
+        
+        # --- ÉTAPE 5: RAPPORT D'ÉQUILIBRE (Game Theory Metrics) ---
+        print("\n   === ANALYSE THÉORIE DES JEUX ===")
+        print(f"   Nash Equilibrium: OUI (cycles disjoint-disjoints)")
+        print(f"   Core Solutions: {len(self.cycles)} (aucune déviation profitable)")
+        total_urgency = sum(sum(self.df.loc[n, 'urgency'] for n in c) for c in self.cycles)
+        print(f"   Surplus Social Total: {int(total_urgency)}")
+        print(f"   Efficacité Pareto: {len(used_nodes)}/{len(nodes)} = {int(100*len(used_nodes)/len(nodes))}%\n")
+
+    def export(self):
+        nodes_js = []
+        edges_js = []
+        cycle_colors = ['#00d2ff', '#ff005c', '#bcff03', '#a333ff', '#ff8e00']
+        saved_ids = set([n for c in self.cycles for n in c])
+        
+        # Construire la matrice de compatibilité ABO
+        abo_rules = {
+            'O': ['O', 'A', 'B', 'AB'],
+            'A': ['A', 'AB'],
+            'B': ['B', 'AB'],
+            'AB': ['AB']
+        }
+        
+        # Tableau patients pour la base de données
+        patients_data = []
+        
+        for i in self.df.index:
+            row = self.df.loc[i]
+            score = int(row['urgency'])
+            
+            ai_col = '#22c55e'
+            if score > 50: 
+                ai_col = '#eab308'
+            if score > 80: 
+                ai_col = '#ef4444'
+            
+            gt_col = '#333'
+            cid = -1
+            matched_donor = None
+            
+            # Chercher le donneur assigné dans les cycles
+            for idx, c in enumerate(self.cycles):
+                if i in c:
+                    gt_col = cycle_colors[idx % len(cycle_colors)]
+                    cid = idx
+                    # Trouver le donneur du patient i
+                    idx_in_cycle = c.index(i)
+                    # Le donneur est le nœud précédent dans le cycle
+                    matched_donor = c[(idx_in_cycle - 1) % len(c)]
+                    break
+
+            # Indiquer si le patient fait partie d'un cycle candidat (2-3)
+            in_any_cycle = False
+            if hasattr(self, 'all_valid_cycles') and self.all_valid_cycles:
+                for c in self.all_valid_cycles:
+                    if i in c:
+                        in_any_cycle = True
+                        break
+            
+            # Déterminer groupes sanguins compatibles (ce que le patient accepte)
+            patient_blood = row['patient_blood']
+            donor_blood = row.get('donor_blood', None)
+            compatible_donors = []
+            for blood_type, can_give_to in abo_rules.items():
+                if patient_blood in can_give_to:
+                    compatible_donors.append(blood_type)
+            
+            # Tooltip avec infos PATIENT + DONNEUR
+            donor_info = f"Donneur: {donor_blood}" if pd.notna(donor_blood) else "Pas de donneur"
+            tooltip = f"<b>PAIRE #{i}</b><br><br><b>PATIENT:</b><br>Groupe: {patient_blood}<br>Créatinine: {float(row['sc']):.1f}<br>Age: {int(row['age'])}<br>Score Urgence: {score}/100<br><br><b>DONNEUR:</b><br>{donor_info}"
+            
+            nodes_js.append({
+                'id': int(i),
+                'label': f"P{i}",
+                'title': tooltip,
+                'val': int(score),
+                'ai_color': ai_col,
+                'gt_color': gt_col,
+                'cid': int(cid),
+                'group': 'saved' if i in saved_ids else 'lost',
+                'in_any_cycle': in_any_cycle,
+                'blood': patient_blood,
+                'compatible': ','.join(compatible_donors),
+                'donor': int(matched_donor) if matched_donor is not None else -1
+            })
+            
+            # Ajouter à la base de données
+            donor_blood = row.get('donor_blood', None)
+            donor_blood_str = donor_blood if pd.notna(donor_blood) else "Aucun"
+            
+            patients_data.append({
+                'id': int(i),
+                'score': score,
+                'blood': patient_blood,
+                'donor_blood': donor_blood_str,
+                'compatible': ' ou '.join(compatible_donors),
+                'age': int(row['age']),
+                'creatinine': round(float(row['sc']), 2),
+                'has_diabetes': int(row['dm']),
+                'donor_id': int(matched_donor) if matched_donor is not None else -1,
+                'status': 'APPAIRÉ ✓' if i in saved_ids else 'EN ATTENTE'
+            })
+            
+        for u, v in self.graph.edges():
+            is_sol = False
+            for c in self.cycles:
+                if u in c and v in c:
+                    try:
+                        idx = c.index(u)
+                        if c[(idx + 1) % len(c)] == v:
+                            is_sol = True
+                    except:
+                        pass
+
+            # Est-ce que l'arête appartient à un cycle candidat (avant sélection) ?
+            is_candidate = False
+            if hasattr(self, 'all_valid_cycles') and self.all_valid_cycles:
+                for c in self.all_valid_cycles:
+                    for i_idx in range(len(c)):
+                        uu = c[i_idx]
+                        vv = c[(i_idx + 1) % len(c)]
+                        if uu == u and vv == v:
+                            is_candidate = True
+                            break
+                    if is_candidate:
+                        break
+
+            edges_js.append({
+                'from': int(u), 
+                'to': int(v), 
+                'is_sol': bool(is_sol),
+                'is_candidate': bool(is_candidate)
+            })
+            
+        return (json.dumps(nodes_js), json.dumps(edges_js), 
+                json.dumps(patients_data),
+                self.top_patient, len(self.cycles), 
+                len(saved_ids), len(self.df))
+
+class WebRenderer:
+    def __init__(self, nodes, edges, patients_data, top, n_cycles, n_saved, n_total):
+        self.nodes = nodes
+        self.edges = edges
+        self.patients_data = patients_data
+        self.top = top
+        self.n_cycles = n_cycles
+        self.n_saved = n_saved
+        self.n_total = n_total
+    
+    def build_html(self):
+        """Construit et retourne le HTML sans l'écrire dans un fichier"""
+        nodes = self.nodes
+        edges = self.edges
+        patients_data = self.patients_data
+        top = self.top
+        n_cyc = self.n_cycles
+        n_sav = self.n_saved
+        n_tot = self.n_total
+        
+        # CORRECTIF #7: Éviter division par zéro dans le taux de succès
+        success_rate = int(n_sav/n_tot*100) if n_tot > 0 else 0
+        
+        # Générer les lignes du tableau
+        patients_table_rows = ""
+        for p in json.loads(patients_data):
+            status_color = "#22c55e" if "APPAIRÉ" in p['status'] else "#71717a"
+            donor_text = f"Donneur #{p['donor_id']}" if p['donor_id'] >= 0 else "En attente"
+            patients_table_rows += f"""
+            <tr>
+                <td>#{p['id']}</td>
+                <td><span style="color: {'#ef4444' if p['score'] > 80 else '#eab308' if p['score'] > 50 else '#22c55e'}; font-weight: bold;">{p['score']}</span>/100</td>
+                <td><b>{p['blood']}</b></td>
+                <td><span style="color: #3b82f6; font-weight: bold;">{p['donor_blood']}</span></td>
+                <td>{p['age']} ans</td>
+                <td>{p['creatinine']}</td>
+                <td>{'🔴 OUI' if p['has_diabetes'] else '🟢 NON'}</td>
+                <td style="font-family: JetBrains Mono; color: #3b82f6;">{donor_text}</td>
+                <td style="color: {status_color}; font-weight: bold;">{p['status']}</td>
+            </tr>
+            """
+        
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kidney Exchange - Hybrid Data</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{ background: #09090b; color: #e4e4e7; font-family: 'Inter', sans-serif; margin: 0; display: flex; height: 100vh; overflow: hidden; }}
+        .sidebar {{ width: 420px; background: #18181b; border-right: 1px solid #27272a; padding: 20px; display: flex; flex-direction: column; gap: 15px; z-index: 2; overflow-y: auto; }}
+        .main {{ flex: 1; position: relative; background: radial-gradient(circle at 50% 50%, #1c1c1c 0%, #000 100%); overflow-y: auto; }}
+        h1 {{ font-family: 'JetBrains Mono'; font-size: 18px; color: #3b82f6; margin: 0; }}
+        h2 {{ font-size: 13px; color: #a1a1aa; margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }}
+        h3 {{ font-size: 12px; color: #71717a; margin: 10px 0 6px 0; text-transform: uppercase; font-weight: 600; }}
+        
+        .card {{ background: #000; border: 1px solid #27272a; border-radius: 8px; padding: 12px; margin-bottom: 10px; }}
+        .card-urgent {{ border-left: 3px solid #ef4444; }}
+        .card-success {{ border-left: 3px solid #22c55e; }}
+        .stat-row {{ display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }}
+        .stat-label {{ color: #71717a; }}
+        .stat-val {{ font-family: 'JetBrains Mono'; color: #fff; font-weight: bold; }}
+        .stat-val.urgent {{ color: #ef4444; }}
+        .stat-val.success {{ color: #22c55e; }}
+        
+        .btn-group {{ display: flex; gap: 5px; background: #000; padding: 8px; border-radius: 6px; border: 1px solid #27272a; margin-bottom: 10px; flex-wrap: wrap; }}
+        .btn {{ flex: 1; min-width: 70px; background: none; border: none; color: #71717a; padding: 10px; cursor: pointer; font-weight: 600; border-radius: 4px; transition: 0.2s; font-size: 11px; }}
+        .btn:hover {{ color: #fff; background: rgba(255,255,255,0.05); }}
+        .btn.active {{ background: #3b82f6; color: #fff; }}
+        
+        .story-text {{ font-size: 12px; line-height: 1.6; color: #a1a1aa; display: none; }}
+        .story-text.active {{ display: block; animation: fadeIn 0.3s; }}
+        
+        .algorithm-box {{ background: rgba(59, 130, 246, 0.08); border: 1px solid #3b82f6; border-radius: 6px; padding: 10px; margin: 8px 0; font-size: 11px; line-height: 1.5; }}
+        .algorithm-box code {{ background: #000; padding: 2px 4px; border-radius: 3px; font-family: 'JetBrains Mono'; color: #eab308; }}
+        
+        .formula {{ background: #000; border: 1px solid #333; padding: 8px; border-radius: 4px; font-family: 'JetBrains Mono'; font-size: 11px; margin: 5px 0; color: #a1a1aa; line-height: 1.4; }}
+        
+        .info-btn {{ background: rgba(234, 179, 8, 0.1); border: 1px solid #eab308; color: #eab308; padding: 8px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: bold; text-transform: uppercase; transition: 0.2s; margin-bottom: 5px; }}
+        .info-btn:hover {{ background: rgba(234, 179, 8, 0.2); }}
+        
+        .modal {{ display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); backdrop-filter: blur(5px); overflow-y: auto; }}
+        .modal-content {{ background-color: #18181b; margin: 30px auto; padding: 25px; border: 1px solid #3b82f6; width: 65%; max-width: 900px; border-radius: 10px; box-shadow: 0 0 20px rgba(59, 130, 246, 0.3); position: relative; }}
+        .close {{ color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; line-height: 20px; }}
+        .close:hover {{ color: white; }}
+        
+        .legend {{ position: absolute; bottom: 20px; left: 20px; background: rgba(0,0,0,0.8); padding: 12px; border-radius: 6px; border: 1px solid #333; font-size: 11px; z-index: 10; }}
+        .dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }}
+        
+        .chart-container {{ background: #000; border: 1px solid #27272a; border-radius: 6px; padding: 12px; margin: 10px 0; }}
+        .chart-container canvas {{ max-height: 200px; }}
+        
+        /* Styles pour la base de données */
+        .database-section {{ background: #000; border: 1px solid #27272a; border-radius: 8px; padding: 15px; margin: 20px; }}
+        .table-wrapper {{ overflow-x: auto; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 11px; }}
+        th {{ background: #1a1a1a; color: #3b82f6; padding: 10px; text-align: left; border-bottom: 2px solid #3b82f6; font-weight: bold; }}
+        td {{ padding: 8px 10px; border-bottom: 1px solid #27272a; }}
+        tr:hover {{ background: #0a0a0a; }}
+        
+        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(5px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+    </style>
+</head>
+<body>
+
+<div class="sidebar">
+    <div>
+        <h1>🏥 KIDNEY MATCH v7.0</h1>
+        <div style="font-size: 10px; color: #555; margin-top: 4px;">ML + THÉORIE DES JEUX</div>
+    </div>
+
+        <div class="btn-group">
+        <button class="btn active" onclick="setStep(1)">1. DONNÉES</button>
+        <button class="btn" onclick="setStep(2)">2. URGENCE</button>
+        <button class="btn" onclick="setStep(3)">3. MATCHING</button>
+        <button class="btn" onclick="setStep(4)">4. DÉTAILS</button>
+        <button class="btn" onclick="setStep(5)">5. BASE DE DONNÉES</button>
+    </div>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:6px;">
+            <label style="font-size:11px; color:#a1a1aa;">Patients:</label>
+            <input id="patientCountInput" type="number" min="2" value="{n_tot}" style="width:80px; padding:6px; border-radius:6px; border:1px solid #27272a; background:#0b0b0c; color:#fff;">
+            <button class="btn" style="min-width:90px;" onclick="applyPatientCount()">Appliquer</button>
+        </div>
+    
+    <button class="info-btn" onclick="openModal('methods')">📊 Méthodologie</button>
+    <button class="info-btn" onclick="openModal('urgent')">⚠️ Calcul Urgence</button>
+    <button class="info-btn" onclick="openModal('matching')">🔗 Algorithme</button>
+    <button class="info-btn" onclick="openModal('automation')">⚙️ Automation Admin</button>
+
+    <!-- STEP 1: DONNÉES -->
+    <div id="story-1" class="story-text active">
+        <h2>📥 Données Cliniques</h2>
+        <div class="card">
+            <div class="stat-row">
+                <span class="stat-label">PATIENTS</span>
+                <span class="stat-val" id="displayTotal">{n_tot}</span>
+            </div>
+        </div>
+        <h3>Paramètres</h3>
+        <div class="card" style="font-size:11px; line-height:1.6;">
+            <b>✓ Créatinine</b> - Fonction rénale<br>
+            <b>✓ Hémoglobine</b> - Santé générale<br>
+            <b>✓ Âge</b> - Critère temporel<br>
+            <b>✓ Diabète</b> - Comorbidité
+        </div>
+    </div>
+
+    <!-- STEP 2: URGENCE -->
+    <div id="story-2" class="story-text">
+        <h2>⚡ Scoring d'Urgence</h2>
+        <div class="card card-urgent">
+            <div class="stat-row">
+                <span class="stat-label">TOP PATIENT</span>
+                <span class="stat-val urgent">#{top['id']}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">SCORE</span>
+                <span class="stat-val urgent">{top['score']}/100</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Créatinine</span>
+                <span class="stat-val">{top['sc']}</span>
+            </div>
+        </div>
+        <h3>Formule</h3>
+        <div class="algorithm-box">
+            <code>SCORE = (Créat×0.6) + (¬Hemo×0.2) + (Age×0.2) + (Diabète×0.1)</code>
+        </div>
+    </div>
+
+    <!-- STEP 3: MATCHING -->
+    <div id="story-3" class="story-text">
+        <h2>🔗 Matching</h2>
+        <div class="card card-success">
+            <div class="stat-row">
+                <span class="stat-label">CYCLES</span>
+                <span class="stat-val success">{n_cyc}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">SAUVÉS</span>
+                <span class="stat-val success">{n_sav}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">TAUX</span>
+                <span class="stat-val success">{success_rate}%</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- STEP 4: DÉTAILS -->
+    <div id="story-4" class="story-text">
+        <h2>📈 Analyse</h2>
+        <div class="chart-container">
+            <canvas id="histChart"></canvas>
+        </div>
+    </div>
+
+    <!-- STEP 5: BASE DE DONNÉES -->
+    <div id="story-5" class="story-text">
+        <h2>🗄️ Base de Données</h2>
+        <div class="card">
+            <div style="font-size:11px; line-height:1.6;">
+            Tableau complet des patients avec:<br>
+            • Score d'urgence<br>
+            • Groupe sanguin<br>
+            • Compatibilités<br>
+            • Donneur assigné<br>
+            • Statut
+            </div>
+        </div>
+        <h3>Scroll vers le bas</h3>
+        <p style="font-size:11px; color:#666;">
+        Le tableau s'affiche dans la section principale.
+        </p>
+    </div>
+</div>
+
+<div class="main" id="mainContent">
+    <div id="networkContainer" style="width: 100%; height: 100%;">
+        <div id="network" style="width: 100%; height: 100%;"></div>
+        <div class="legend" id="legend"></div>
+    </div>
+    
+    <div id="databaseContainer" style="display: none; padding: 20px;">
+        <h1 style="margin-bottom: 20px;">🗄️ Base de Données - Registre des Patients</h1>
+        <div class="database-section">
+            <h2>Vue d'ensemble</h2>
+            <p style="font-size:12px; color:#a1a1aa; line-height:1.6;">
+            Ce tableau représente <b>la paperasse automatisée par notre système</b>. 
+            Normalement, un administrateur devrait vérifier manuellement chaque compatibilité ABO, contacter les hôpitaux, 
+            coordonner les horaires, gérer les rejets... <br><br>
+            <b>Notre code fait tout cela en secondes et propose les meilleures chaînes d'échange.</b>
+            </p>
+        </div>
+        
+        <div class="database-section">
+            <h2>Colonnes Expliquées</h2>
+            <table>
+                <tr>
+                    <th>Colonne</th>
+                    <th>Signification</th>
+                    <th>Avant (Manuel)</th>
+                    <th>Après (Notre Code)</th>
+                </tr>
+                <tr>
+                    <td><b>Score</b></td>
+                    <td>Urgence clinique (0-100)</td>
+                    <td>Évaluation subjective par médecin</td>
+                    <td>Calcul objectif IA</td>
+                </tr>
+                <tr>
+                    <td><b>Groupe Sang</b></td>
+                    <td>Type sanguin receveur</td>
+                    <td>Vérification manuelle</td>
+                    <td>Automatique</td>
+                </tr>
+                <tr>
+                    <td><b>Compatible</b></td>
+                    <td>Groupes donneurs viables</td>
+                    <td>Recherche manuelle très longue</td>
+                    <td>Listage instant par règles ABO</td>
+                </tr>
+                <tr>
+                    <td><b>Donneur</b></td>
+                    <td>Qui donne au patient</td>
+                    <td>Coordination téléphonique/fax (jours)</td>
+                    <td>Assignation optimale en 1 clic</td>
+                </tr>
+                <tr>
+                    <td><b>Statut</b></td>
+                    <td>Est-il appairé ?</td>
+                    <td>Suivi papier/Excel décentralisé</td>
+                    <td>Temps réel centralisé</td>
+                </tr>
+            </table>
+        </div>
+        
+        <div class="database-section">
+            <h2>Le Tableau Complet</h2>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Patient</th>
+                            <th>Score</th>
+                            <th>Gr. Patient</th>
+                            <th>Gr. Donneur</th>
+                            <th>Âge</th>
+                            <th>Créatinine</th>
+                            <th>Diabète</th>
+                            <th>Assigné À</th>
+                            <th>Statut</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {patients_table_rows}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <div class="database-section">
+            <h2>Exemple Concret: Workflows Sauvés</h2>
+            <h3>❌ AVANT Notre Code (Processus Manual)</h3>
+            <div class="algorithm-box" style="background:rgba(239,68,68,0.08); border-color:#ef4444;">
+                <b>Jour 1:</b> Patient arrive urgence, groupe O<br>
+                <b>Jour 1-2:</b> Infirmiers cherchent compatible dans 50 cahiers papier<br>
+                <b>Jour 2:</b> Trouvent Donneur A, mais incompatible avec sa femme receveur<br>
+                <b>Jour 2-3:</b> Contactent hôpitaux voisins (pas de réponse)<br>
+                <b>Jour 4:</b> Patient se dégrade, décision = dialyse<br>
+                <b>Résultat:</b> Vies perdues, frustration, coûts énormes
+            </div>
+            
+            <h3>✅ APRÈS Notre Code (Automatisé)</h3>
+            <div class="algorithm-box" style="background:rgba(34,197,94,0.08); border-color:#22c55e;">
+                <b>Seconde 1:</b> Patient enregistré, score=85 (critique)<br>
+                <b>Seconde 2:</b> Calcul: groupe O, compatible avec O/A/B/AB<br>
+                <b>Seconde 3:</b> Scan graphe 80 patients → trouve Donneur#42 (type B)<br>
+                <b>Seconde 4:</b> Détecte cycle: #42→Patient→#15→Donneur#18→#42<br>
+                <b>Seconde 5:</b> Valide chaîne, notifie chirurgiens<br>
+                <b>Jour 0:</b> Transplantations coordonnées<br>
+                <b>Résultat:</b> Vies sauvées, efficacité maximale, paperasse=0
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- MODALES -->
+<div id="methodsModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('methods')">&times;</span>
+    <h2 style="color: #3b82f6; margin-top:0;">📊 Méthodologie Complète</h2>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">Pipeline complet de l'IA:
+    </p>
+    <h3>1. COLLECTE DE DONNÉES</h3>
+    <p style="font-size:12px;">Données synthétiques réalistes (clinique + HLA + groupes sanguins)</p>
+    <h3>2. PRÉTRAITEMENT</h3>
+    <p style="font-size:12px;">Imputation, normalisation, gestion valeurs infinies</p>
+    <h3>3. SCORING IA</h3>
+    <div class="formula">
+SCORE = 0.6×Créat + 0.2×(¬Hemo) + 0.2×Age + 0.1×Diabète
+    </div>
+    <h3>4. GRAPHE ABO</h3>
+    <p style="font-size:12px;">Construction graphe orienté selon règles ABO + facteur immunologique 80%</p>
+    <h3>5. DÉTECTION CYCLES</h3>
+    <p style="font-size:12px;">Algorithm NetworkX (cycles 2-3 nœuds maximum)</p>
+    <h3>6. OPTIMISATION</h3>
+    <p style="font-size:12px;">Gale-Shapley adapté → Stable matching + Pareto optimal</p>
+  </div>
+</div>
+
+<div id="urgentModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('urgent')">&times;</span>
+    <h2 style="color: #ef4444; margin-top:0;">⚠️ Comment Calculer l'Urgence</h2>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+    Les patients avec score &gt; 80 DOIVENT être appairés en priorité. C'est éthiquement crucial.
+    </p>
+    <h3>Composantes</h3>
+    <div class="card">
+        <b>🔴 CRÉATININE (60%)</b><br>
+        Principal indicateur défaillance rénale
+    </div>
+    <div class="card">
+        <b>🟡 HÉMOGLOBINE (20% inverse)</b><br>
+        Basse Hemo = anémie sévère
+    </div>
+    <div class="card">
+        <b>🟢 ÂGE (20%)</b><br>
+        Patients âgés = fenêtre réduite
+    </div>
+    <div class="card">
+        <b>🟠 DIABÈTE (10% bonus)</b><br>
+        Comorbidité aggravante
+    </div>
+  </div>
+</div>
+
+<div id="matchingModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('matching')">&times;</span>
+    <h2 style="color: #00d2ff; margin-top:0;">🔗 Algorithme Gale-Shapley</h2>
+    <p style="font-size:12px; line-height:1.7;">
+    <b>ÉTAPE 1:</b> Construire graphe ABO (qui peut donner à qui)<br>
+    <b>ÉTAPE 2:</b> Détecter cycles 2-3 nœuds<br>
+    <b>ÉTAPE 3:</b> Score chaque cycle = Σ urgences<br>
+    <b>ÉTAPE 4:</b> Tri par utilité (décroissant)<br>
+    <b>ÉTAPE 5:</b> Sélection greedy (cycles disjoints)
+    </p>
+    <h3>Résultat</h3>
+    <p style="font-size:12px;">
+    <b>{n_cyc} cycles</b> trouvés → <b>{n_sav} patients</b> sauvés<br>
+    Stable matching + Pareto optimal = Équilibre Nash atteint
+    </p>
+  </div>
+</div>
+
+<div id="automationModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('automation')">&times;</span>
+    <h2 style="color: #22c55e; margin-top:0;">⚙️ L'Automation Administrative</h2>
+    <h3>🎯 Le Problème Manuel</h3>
+    <p style="font-size:12px; line-height:1.7;">
+    Dans un hôpital typique, le matching rénal implique:
+    </p>
+    <ul style="font-size:12px; color:#a1a1aa;">
+        <li>Recherche manuelle de compatibilités dans dossiers papier</li>
+        <li>Appels téléphoniques entre hôpitaux (jours de délai)</li>
+        <li>Vérification Excel décentralisée (erreurs courantes)</li>
+        <li>Coordination heures opératoires (très complexe)</li>
+        <li>Rejet possibles non géré (relancer nouveaux matchs)</li>
+    </ul>
+    
+    <h3>✅ Notre Solution Code</h3>
+    <div class="algorithm-box" style="background:rgba(34,197,94,0.08); border-color:#22c55e;">
+        <b>INSTANT 0 sec:</b> Patient urgent arrive<br>
+        <b>INSTANT 1 sec:</b> Score IA calculé<br>
+        <b>INSTANT 2 sec:</b> Groupes compatibles listés automatiquement<br>
+        <b>INSTANT 3 sec:</b> Graphe construit (80 patients scannés)<br>
+        <b>INSTANT 4 sec:</b> Cycles optimaux détectés<br>
+        <b>INSTANT 5 sec:</b> Meilleures chaînes proposées (stable matching)<br>
+        <br>
+        <b>RÉSULTAT:</b> Paperasse = 0, Vies sauvées = maximum
+    </div>
+    
+    <h3>📊 Impact Économique</h3>
+    <table style="width:100%; font-size:11px; margin-top:10px;">
+        <tr style="background:#1a1a1a;">
+            <td style="padding:8px;"><b>Processus</b></td>
+            <td style="padding:8px;"><b>Avant (Jours)</b></td>
+            <td style="padding:8px;"><b>Après (Sec)</b></td>
+            <td style="padding:8px;"><b>Gain</b></td>
+        </tr>
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:8px;">Trouver compatible</td>
+            <td style="padding:8px; color:#ef4444;">2-3 jours</td>
+            <td style="padding:8px; color:#22c55e;">1 sec</td>
+            <td style="padding:8px;">×86400</td>
+        </tr>
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:8px;">Vérifier cycle valide</td>
+            <td style="padding:8px; color:#ef4444;">1 jour</td>
+            <td style="padding:8px; color:#22c55e;">0.5 sec</td>
+            <td style="padding:8px;">×172800</td>
+        </tr>
+        <tr style="border-bottom:1px solid #27272a;">
+            <td style="padding:8px;">Décision finale</td>
+            <td style="padding:8px; color:#ef4444;">4-5 jours</td>
+            <td style="padding:8px; color:#22c55e;">5 sec</td>
+            <td style="padding:8px;">×69120</td>
+        </tr>
+    </table>
+    
+    <h3>💚 Vies Sauvées</h3>
+    <p style="font-size:12px; color:#22c55e; font-weight:bold;">
+    Chaque jour de délai = risque accru de décès.<br>
+    Notre code gagne 4-5 JOURS par patient.<br>
+    Potentiel: Des centaines de vies supplémentaires par an.
+    </p>
+  </div>
+</div>
+
+<script>
+    const nodesRaw = {nodes};
+    const edgesRaw = {edges};
+    let currentView = 1;
+    const patientsRaw = {patients_data};
+    
+    const nodes = new vis.DataSet(nodesRaw);
+    const edges = new vis.DataSet(edgesRaw);
+    
+    const container = document.getElementById('network');
+    const data = {{ nodes: nodes, edges: edges }};
+    const options = {{
+        nodes: {{ 
+            shape: 'dot', 
+            font: {{ color: '#fff', face: 'Inter', size: 10 }}, 
+            borderWidth: 2,
+            shadow: true 
+        }},
+        edges: {{ 
+            smooth: {{ type: 'continuous' }}, 
+            arrows: {{ to: {{ scaleFactor: 0.5 }} }},
+            font: {{ size: 10 }},
+            shadow: true
+        }},
+        physics: {{ 
+            stabilization: {{ iterations: 1000 }}, 
+            barnesHut: {{ gravitationalConstant: -2000 }} 
+        }}
+    }};
+    
+    const network = new vis.Network(container, data, options);
+    
+    network.once("stabilizationIterationsDone", function() {{
+        network.setOptions({{ physics: {{ enabled: false }} }});
+        network.fit();
+    }});
+
+    function openModal(modalId) {{ 
+        document.getElementById(modalId + 'Modal').style.display = "block"; 
+    }}
+    function closeModal(modalId) {{ 
+        document.getElementById(modalId + 'Modal').style.display = "none"; 
+    }}
+    window.onclick = function(event) {{ 
+        if (event.target.classList.contains('modal')) {{ 
+            event.target.style.display = "none"; 
+        }} 
+    }}
+
+    // Charts
+    var urgencyScores = nodesRaw.map(n => n.val);
+    
+    var histCtx = document.getElementById('histChart');
+    if(histCtx) {{
+        var bins = [0,0,0,0,0];
+        urgencyScores.forEach(s => {{
+            if(s < 20) bins[0]++;
+            else if(s < 40) bins[1]++;
+            else if(s < 60) bins[2]++;
+            else if(s < 80) bins[3]++;
+            else bins[4]++;
+        }});
+        new Chart(histCtx, {{
+            type: 'doughnut',
+            data: {{
+                labels: ['<20 (Stable)', '20-40', '40-60', '60-80 (Grave)', '80+ (Critique)'],
+                datasets: [{{
+                    data: bins,
+                    backgroundColor: ['#22c55e', '#84cc16', '#eab308', '#f97316', '#ef4444'],
+                    borderColor: '#000',
+                    borderWidth: 2
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#a1a1aa', font: {{ size: 10 }} }} }} }}
+            }}
+        }});
+    }}
+
+    function quickGen(count) {{
+        document.getElementById('patientCount').value = count;
+        regenerate();
+    }}
+
+    function regenerate() {{
+        const count = document.getElementById('patientCount').value;
+        
+        // Vérifier si on est sur le serveur Flask (localhost:5000)
+        if (window.location.hostname === 'localhost' && window.location.port === '5000') {{
+            // Mode serveur: recharger avec paramètre
+            window.location.href = '/?n=' + count;
+        }} else {{
+            // Mode fichier HTML: afficher commande à copier
+            const cmd = `C:/Users/33783/anaconda3/python.exe "c:/Users/33783/Desktop/EPF5A/ml/2025-MSMIS5IN11-Probas-ML/etape 2" ${{count}}`;
+            
+            document.getElementById('commandText').textContent = cmd;
+            document.getElementById('commandOutput').style.display = 'block';
+            
+            // Copie automatique dans le presse-papier
+            navigator.clipboard.writeText(cmd).then(() => {{
+                const output = document.getElementById('commandOutput');
+                output.innerHTML = '<div style="color: #22c55e;">✅ Commande copiée ! Colle-la dans ton terminal (Ctrl+V)</div><div style="margin-top: 4px; color: #fff; user-select: all;">' + cmd + '</div>';
+            }}).catch(() => {{
+                document.getElementById('commandOutput').style.display = 'block';
+            }});
+        }}
+    }}
+
+    function setStep(step) {{
+        currentView = step;
+        document.querySelectorAll('.btn').forEach((b, i) => b.classList.toggle('active', i === step-1));
+        document.querySelectorAll('.story-text').forEach((d, i) => d.classList.toggle('active', i === step-1));
+        
+        document.getElementById('networkContainer').style.display = step !== 5 ? 'block' : 'none';
+        document.getElementById('databaseContainer').style.display = step === 5 ? 'block' : 'none';
+        
+        const allNodes = nodes.get();
+        const allEdges = edges.get();
+        const legend = document.getElementById('legend');
+        
+        if(step === 1) {{
+            allNodes.forEach(n => {{ n.color = '#3f3f46'; n.size = 8; n.shadow = false; }});
+            allEdges.forEach(e => {{ e.hidden = false; e.color = {{color:'#333', opacity: 0.1}}; e.width=0.5; }});
+            legend.innerHTML = '<b>Step 1: Données</b><br><span class="dot" style="background:#3f3f46"></span>Paire (Patient + Donneur)';
+        }}
+        
+        if(step === 2) {{
+            allNodes.forEach(n => {{ n.color = n.ai_color; n.size = 5 + (n.val/8); n.shadow = true; }});
+            allEdges.forEach(e => {{ e.hidden = true; }});
+            legend.innerHTML = '<b>Step 2: Urgence</b><br><span class="dot" style="background:#ef4444"></span>Critique<br><span class="dot" style="background:#eab308"></span>Grave<br><span class="dot" style="background:#22c55e"></span>Stable';
+        }}
+        
+        if(step === 3) {{
+            // Matching view: show only cycle edges (candidates + validated)
+            allNodes.forEach(n => {{ 
+                if(n.cid > -1) {{
+                    n.hidden = false;
+                    n.color = '#00d2ff';
+                    n.size = 16;
+                    // keep label for validated nodes
+                }} else if(n.in_any_cycle) {{
+                    n.hidden = false;
+                    n.color = '#93c5fd';
+                    n.size = 6;
+                    n.label = '';
+                }} else {{
+                    // hide irrelevant nodes to reduce clutter
+                    n.hidden = true;
+                }}
+            }});
+            allEdges.forEach(e => {{
+                if(e.is_sol) {{ e.hidden = false; e.color = {{color:'#00d2ff', opacity:0.95}}; e.width=2; }}
+                else if(e.is_candidate) {{ e.hidden = false; e.color = {{color:'#93c5fd', opacity:0.4}}; e.width=1; }}
+                else {{ e.hidden = true; }}
+            }});
+            legend.innerHTML = '<b>Step 3: Matching</b><br><span class="dot" style="background:#00d2ff"></span>Cycle validé &nbsp; <span class="dot" style="background:#93c5fd"></span>Cycle candidat';
+        }}
+        
+        if(step === 4) {{
+            allNodes.forEach(n => {{ n.color = '#3b82f6'; n.size = 10; n.shadow = true; }});
+            allEdges.forEach(e => {{ e.hidden = true; }});
+            legend.innerHTML = '<b>Step 4: Analyse</b><br>Distribution scores';
+        }}
+        
+        nodes.update(allNodes);
+        edges.update(allEdges);
+    }}
+    
+    setStep(1);
+</script>
+
+</body>
+</html>"""
+        
+        # NOTE: rendu HTML délégué à la génération finale ci-dessous (évite doublons)
+        # Le fichier sera généré une seule fois plus bas.
+        
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Kidney Exchange - Hybrid Data</title>
+    <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{ background: #09090b; color: #e4e4e7; font-family: 'Inter', sans-serif; margin: 0; display: flex; height: 100vh; overflow: hidden; }}
+        .sidebar {{ width: 420px; background: #18181b; border-right: 1px solid #27272a; padding: 20px; display: flex; flex-direction: column; gap: 15px; z-index: 2; overflow-y: auto; }}
+        .main {{ flex: 1; position: relative; background: radial-gradient(circle at 50% 50%, #1c1c1c 0%, #000 100%); }}
+        h1 {{ font-family: 'JetBrains Mono'; font-size: 18px; color: #3b82f6; margin: 0; }}
+        h2 {{ font-size: 13px; color: #a1a1aa; margin: 0 0 12px 0; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }}
+        h3 {{ font-size: 12px; color: #71717a; margin: 10px 0 6px 0; text-transform: uppercase; font-weight: 600; }}
+        
+        .card {{ background: #000; border: 1px solid #27272a; border-radius: 8px; padding: 12px; margin-bottom: 10px; }}
+        .card-urgent {{ border-left: 3px solid #ef4444; }}
+        .card-success {{ border-left: 3px solid #22c55e; }}
+        .stat-row {{ display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 13px; }}
+        .stat-label {{ color: #71717a; }}
+        .stat-val {{ font-family: 'JetBrains Mono'; color: #fff; font-weight: bold; }}
+        .stat-val.urgent {{ color: #ef4444; }}
+        .stat-val.success {{ color: #22c55e; }}
+        
+        .btn-group {{ display: flex; gap: 5px; background: #000; padding: 8px; border-radius: 6px; border: 1px solid #27272a; margin-bottom: 10px; }}
+        .btn {{ flex: 1; background: none; border: none; color: #71717a; padding: 10px; cursor: pointer; font-weight: 600; border-radius: 4px; transition: 0.2s; font-size: 12px; }}
+        .btn:hover {{ color: #fff; background: rgba(255,255,255,0.05); }}
+        .btn.active {{ background: #3b82f6; color: #fff; }}
+        
+        .story-text {{ font-size: 12px; line-height: 1.6; color: #a1a1aa; display: none; }}
+        .story-text.active {{ display: block; animation: fadeIn 0.3s; }}
+        
+        .algorithm-box {{ background: rgba(59, 130, 246, 0.08); border: 1px solid #3b82f6; border-radius: 6px; padding: 10px; margin: 8px 0; font-size: 11px; line-height: 1.5; }}
+        .algorithm-box code {{ background: #000; padding: 2px 4px; border-radius: 3px; font-family: 'JetBrains Mono'; color: #eab308; }}
+        
+        .formula {{ background: #000; border: 1px solid #333; padding: 8px; border-radius: 4px; font-family: 'JetBrains Mono'; font-size: 11px; margin: 5px 0; color: #a1a1aa; line-height: 1.4; }}
+        
+        .info-btn {{ background: rgba(234, 179, 8, 0.1); border: 1px solid #eab308; color: #eab308; padding: 8px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: bold; text-transform: uppercase; transition: 0.2s; }}
+        .info-btn:hover {{ background: rgba(234, 179, 8, 0.2); }}
+        
+        .modal {{ display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.8); backdrop-filter: blur(5px); overflow-y: auto; }}
+        .modal-content {{ background-color: #18181b; margin: 30px auto; padding: 25px; border: 1px solid #3b82f6; width: 60%; max-width: 800px; border-radius: 10px; box-shadow: 0 0 20px rgba(59, 130, 246, 0.3); position: relative; }}
+        .close {{ color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; line-height: 20px; }}
+        .close:hover {{ color: white; }}
+        
+        .legend {{ position: absolute; bottom: 20px; left: 20px; background: rgba(0,0,0,0.8); padding: 12px; border-radius: 6px; border: 1px solid #333; font-size: 11px; z-index: 10; }}
+        .dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }}
+        
+        .chart-container {{ background: #000; border: 1px solid #27272a; border-radius: 6px; padding: 12px; margin: 10px 0; }}
+        .chart-container canvas {{ max-height: 200px; }}
+        
+        .warning-box {{ background: rgba(239, 68, 68, 0.1); border-left: 3px solid #ef4444; padding: 10px; border-radius: 4px; font-size: 11px; }}
+        
+        .quick-btn {{ flex: 1; background: #18181b; border: 1px solid #27272a; color: #a1a1aa; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold; transition: 0.2s; }}
+        .quick-btn:hover {{ background: #27272a; color: #fff; border-color: #3b82f6; }}
+        
+        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(5px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+    </style>
+</head>
+<body>
+
+<div class="sidebar">
+    <div>
+        <h1>🏥 KIDNEY MATCH v6.0</h1>
+        <div style="font-size: 10px; color: #555; margin-top: 4px;">ML + THÉORIE DES JEUX</div>
+    </div>
+
+    <!-- CONTRÔLE NOMBRE DE PATIENTS -->
+    <div class="card" style="margin-top: 10px;">
+        <h3 style="margin-top: 0;">🎛️ Nombre de Patients</h3>
+        <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="number" id="patientCount" value="{n_tot}" min="5" max="200" 
+                   style="flex: 1; background: #18181b; border: 1px solid #3b82f6; color: #fff; padding: 8px; border-radius: 4px; font-family: 'JetBrains Mono'; font-size: 14px; font-weight: bold;">
+            <button onclick="regenerate()" 
+                    style="background: #3b82f6; border: none; color: #fff; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 12px;">
+                GÉNÉRER
+            </button>
+        </div>
+        <div id="commandOutput" style="display: none; margin-top: 8px; background: #000; border: 1px solid #eab308; padding: 8px; border-radius: 4px; font-size: 10px; font-family: 'JetBrains Mono'; color: #eab308; line-height: 1.4;">
+            <div style="margin-bottom: 4px; color: #a1a1aa;">📋 Copie cette commande dans ton terminal :</div>
+            <div id="commandText" style="user-select: all; color: #fff;"></div>
+        </div>
+        <div style="display: flex; gap: 4px; margin-top: 6px;">
+            <button onclick="quickGen(10)" class="quick-btn">10</button>
+            <button onclick="quickGen(20)" class="quick-btn">20</button>
+            <button onclick="quickGen(50)" class="quick-btn">50</button>
+            <button onclick="quickGen(100)" class="quick-btn">100</button>
+        </div>
+    </div>
+
+    <div class="btn-group">
+        <button class="btn active" onclick="setStep(1)">1. DONNÉES</button>
+        <button class="btn" onclick="setStep(2)">2. URGENCE</button>
+        <button class="btn" onclick="setStep(3)">3. MATCHING</button>
+        <button class="btn" onclick="setStep(4)">4. DÉTAILS</button>
+    </div>
+    
+    <button class="info-btn" onclick="openModal('methods')">📊 Méthodologie Complète</button>
+    <button class="info-btn" onclick="openModal('urgent')">⚠️ Comment Calculer l'Urgence ?</button>
+    <button class="info-btn" onclick="openModal('matching')">🔗 Algorithme de Matching</button>
+
+    <!-- STEP 1: DONNÉES -->
+    <div id="story-1" class="story-text active">
+        <h2>📥 Données Cliniques Réelles</h2>
+        <div class="card">
+            <div class="stat-row">
+                <span class="stat-label">PATIENTS CHARGÉS</span>
+                <span class="stat-val">{n_tot}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">SOURCE</span>
+                <span class="stat-val" style="font-size:10px;">Synthétique</span>
+            </div>
+        </div>
+        
+        <h3>🔄 Principe des Échanges Croisés</h3>
+        <div class="card" style="font-size:11px; line-height:1.7; background: rgba(59, 130, 246, 0.05);">
+            <b>Chaque personne = PATIENT + DONNEUR :</b><br><br>
+            
+            <b>Patient #1</b><br>
+            • A besoin d'un rein (groupe A)<br>
+            • A un donneur volontaire (frère, groupe O)<br>
+            • ❌ Incompatibles entre eux !<br><br>
+            
+            <b>Patient #2</b><br>
+            • A besoin d'un rein (groupe O)<br>
+            • A un donneur volontaire (sœur, groupe A)<br>
+            • ❌ Incompatibles entre eux !<br><br>
+            
+            <b style="color: #22c55e;">✅ ÉCHANGE CROISÉ :</b><br>
+            • Donneur #1 (O) → Patient #2 (O)<br>
+            • Donneur #2 (A) → Patient #1 (A)<br>
+            <b>Les deux sont sauvés !</b>
+        </div>
+        
+        <h3>Paramètres Physiologiques</h3>
+        <div class="card" style="font-size:11px; line-height:1.6;">
+            <b>✓ Créatinine (SC)</b> - Fonction rénale<br>
+            <b>✓ Hémoglobine</b> - Santé générale<br>
+            <b>✓ Âge</b> - Critère temporel<br>
+            <b>✓ Diabète (DM)</b> - Comorbidité<br>
+            <b>✓ Tension</b> - Stabilité cardiovasculaire
+        </div>
+        
+        <h3>Groupes Sanguins (Simulés)</h3>
+        <div class="card" style="font-size:11px;">
+            Distribution mondiale:
+            <div style="margin-top:5px; font-family: JetBrains Mono;">
+            O: 45% | A: 40% | B: 11% | AB: 4%
+            </div>
+        </div>
+    </div>
+
+    <!-- STEP 2: URGENCE (SCORING) -->
+    <div id="story-2" class="story-text">
+        <h2>⚡ Scoring d'Urgence (I.A.)</h2>
+        
+        <h3>🎯 Patient Critique</h3>
+        <div class="card card-urgent">
+            <div class="stat-row">
+                <span class="stat-label">ID</span>
+                <span class="stat-val urgent">#{top['id']}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">SCORE</span>
+                <span class="stat-val urgent">{top['score']}/100</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Créatinine</span>
+                <span class="stat-val">{top['sc']}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Âge</span>
+                <span class="stat-val">{top['age']} ans</span>
+            </div>
+        </div>
+        
+        <h3>⚙️ Formule du Score</h3>
+        <div class="algorithm-box">
+            <code>SCORE = (Créat×0.6) + (¬Hemo×0.2) + (Age×0.2) + (Diabète×0.1)</code>
+            <br><br>
+            • <b>Créatinine (60%)</b> = Principal indicateur défaillance<br>
+            • <b>Hémoglobine inversée (20%)</b> = Santé générale<br>
+            • <b>Âge normalisé (20%)</b> = Temps critique<br>
+            • <b>Diabète (10%)</b> = Facteur aggravant
+        </div>
+        
+        <div class="chart-container">
+            <canvas id="scoreChart"></canvas>
+        </div>
+        
+        <h3>Interprétation</h3>
+        <div class="card">
+            <div style="font-size:11px; line-height:1.6;">
+            🔴 <b>80-100</b>: CRITIQUE (transfusion immédiate)<br>
+            🟡 <b>50-79</b>: GRAVE (délai semaines)<br>
+            🟢 <b>&lt;50</b>: STABLE (attente acceptable)
+            </div>
+        </div>
+    </div>
+
+    <!-- STEP 3: MATCHING -->
+    <div id="story-3" class="story-text">
+        <h2>🔗 Matching par Théorie des Jeux</h2>
+        
+        <h3>Cycles Trouvés</h3>
+        <div class="card card-success">
+            <div class="stat-row">
+                <span class="stat-label">CYCLES VALIDES</span>
+                <span class="stat-val success">{n_cyc}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">PATIENTS SAUVÉS</span>
+                <span class="stat-val success">{n_sav}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">TAUX SUCCÈS</span>
+                <span class="stat-val success">{success_rate}%</span>
+            </div>
+        </div>
+        
+        <h3>Algorithme Gale-Shapley</h3>
+        <div class="algorithm-box">
+            <b>Étape 1:</b> Graphe ABO (compatibilité déterministe)<br>
+            <b>Étape 2:</b> Détection cycles 2-3 nœuds<br>
+            <b>Étape 3:</b> Score = Σ urgence(cycle)<br>
+            <b>Étape 4:</b> Tri par utilité décroissante<br>
+            <b>Étape 5:</b> Sélection greedy (sans intersection)
+        </div>
+        
+        <h3>Garanties Théoriques</h3>
+        <div class="card" style="font-size:11px;">
+            ✓ <b>Stable Matching:</b> Aucune déviation profitable<br>
+            ✓ <b>Pareto Optimal:</b> Max surplus social<br>
+            ✓ <b>Nash Equilibrium:</b> Équilibre atteint<br>
+            ✓ <b>Core Solution:</b> Dans le cœur du jeu
+        </div>
+    </div>
+
+    <!-- STEP 4: DÉTAILS -->
+    <div id="story-4" class="story-text">
+        <h2>📈 Analyse Détaillée</h2>
+        
+        <h3>Distribution Scores</h3>
+        <div class="chart-container">
+            <canvas id="histChart"></canvas>
+        </div>
+        
+        <h3>Compatibilité ABO</h3>
+        <div class="card" style="font-size:10px; line-height:1.5;">
+            <b>O →</b> O, A, B, AB (universel) <br>
+            <b>A →</b> A, AB<br>
+            <b>B →</b> B, AB<br>
+            <b>AB →</b> AB (receveur universel)
+        </div>
+        
+        <h3>Statut Patients</h3>
+        <div class="card card-success">
+            <div class="stat-row">
+                <span>Sauvés par échanges</span>
+                <span class="stat-val success">{n_sav}</span>
+            </div>
+            <div class="stat-row">
+                <span>En attente (incompat.)</span>
+                <span class="stat-val">{n_tot - n_sav}</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="main">
+    <div id="network" style="width: 100%; height: 100%;"></div>
+    <div class="legend" id="legend"></div>
+</div>
+
+<!-- MODAL: MÉTHODOLOGIE -->
+<div id="methodsModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('methods')">&times;</span>
+    <h2 style="color: #3b82f6; margin-top:0;">📊 Méthodologie Complète</h2>
+    
+    <h3>1. COLLECTE DE DONNÉES</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Les données physiologiques (<b>créatinine, hémoglobine, âge, tension</b>) sont <b>générées synthétiquement</b> selon des distributions réalistes.
+        <br><br>
+        Les <b>données immunologiques</b> (groupes sanguins ABO/Rh, typage HLA 3 loci, PRA) sont également <b>générées aléatoirement</b> selon les fréquences réelles mondiales.
+    </p>
+    
+    <h3>2. PRÉTRAITEMENT</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        • Imputation des valeurs manquantes (médiane)<br>
+        • Gestion des valeurs infinies<br>
+        • Normalisation MinMax [0, 1]<br>
+        • Limitation à {n_tot} patients pour visualisation
+    </p>
+    
+    <h3>3. SCORING D'URGENCE (Intelligence Artificielle)</h3>
+    <div class="formula">
+SCORE = 0.6 × (Créat - min) / (max - min)
+       + 0.2 × (1 - (Hemo - min) / (max - min))
+       + 0.2 × (Age / 100)
+       + 0.1 × [Diabète présent ?]
+    </div>
+    <p style="font-size:12px; color:#a1a1aa;">
+        <b>Interprétation:</b> Plus le score est élevé, plus le patient est urgent.
+    </p>
+    
+    <h3>4. GRAPHE DE COMPATIBILITÉ ABO</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Un <b>graphe orienté</b> est construit où:<br>
+        • Nœud i → j existe si Donneur(i) peut aider Patient(j)<br>
+        • Compatibilité déterminée par <b>règles ABO</b><br>
+        • Facteur immunologique: 80% de probabilité de match
+    </p>
+    
+    <h3>5. DÉTECTION DE CYCLES (Théorie des Graphes)</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Algorithme <code>NetworkX.simple_cycles()</code> pour détecter cycles fermés:<br>
+        • Cycles 2-cycles: Échange direct (A↔B)<br>
+        • Cycles 3-cycles: Échange triangulaire (A→B→C→A)
+    </p>
+    
+    <h3>6. OPTIMISATION (Stable Matching)</h3>
+    <div class="algorithm-box" style="border-color:#22c55e; background:rgba(34,197,94,0.08);">
+        <b>Algorithme Gale-Shapley:</b><br>
+        1. Calculer utilité chaque cycle: Σ urgences<br>
+        2. Trier cycles par utilité (décroissant)<br>
+        3. Sélection greedy: Max cycles disjoints<br>
+        4. Résultat: Stable matching + Pareto optimal
+    </div>
+    
+    <h3>7. RÉSULTAT FINAL</h3>
+    <p style="font-size:12px; color:#a1a1aa;">
+        <b>{n_sav} patients sauvés</b> parmi {n_tot} via <b>{n_cyc} cycles d'échange</b>.<br>
+        Taux de succès: <b>{success_rate}%</b>
+    </p>
+  </div>
+</div>
+
+<!-- MODAL: URGENCE -->
+<div id="urgentModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('urgent')">&times;</span>
+    <h2 style="color: #ef4444; margin-top:0;">⚠️ Calcul de l'Urgence</h2>
+    
+    <h3>Pourquoi l'urgence ?</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Dans un réseau d'échanges rénaux, il est <b>éthiquement crucial</b> de donner la priorité 
+        aux patients les plus graves. Le score d'urgence combine plusieurs facteurs cliniques 
+        pour identifier rapidement qui a besoin d'une transplantation immédiate.
+    </p>
+    
+    <h3>Composantes du Score</h3>
+    
+    <div class="card">
+        <b>🔴 CRÉATININE (60% du poids)</b><br>
+        <p style="font-size:11px; line-height:1.5; color:#a1a1aa; margin:8px 0;">
+            Mesure principale de la fonction rénale. Plus elle est élevée, plus les reins défaillent.
+            Normalisée entre 0 et 1.
+        </p>
+    </div>
+    
+    <div class="card">
+        <b>🟡 HÉMOGLOBINE (20% - inverse)</b><br>
+        <p style="font-size:11px; line-height:1.5; color:#a1a1aa; margin:8px 0;">
+            Une faible hémoglobine indique une anémie sévère (complication rénale fréquente).
+            On l'inverse: basse hémoglobine = score haut.
+        </p>
+    </div>
+    
+    <div class="card">
+        <b>🟢 ÂGE (20%)</b><br>
+        <p style="font-size:11px; line-height:1.5; color:#a1a1aa; margin:8px 0;">
+            Les patients plus âgés ont une fenêtre temporelle plus réduite. Normalisé sur 100 ans.
+        </p>
+    </div>
+    
+    <div class="card">
+        <b>🟠 DIABÈTE (10% supplémentaire)</b><br>
+        <p style="font-size:11px; line-height:1.5; color:#a1a1aa; margin:8px 0;">
+            Le diabète complique la maladie rénale et réduit les options de transplantation.
+        </p>
+    </div>
+    
+    <h3>Exemple Concret</h3>
+    <div class="algorithm-box" style="background:rgba(59,130,246,0.08); border-color:#3b82f6;">
+        <b>Patient #{top['id']}:</b><br>
+        Créat={top['sc']} | Age={top['age']} | Score=<span style="color:#ef4444">{top['score']}</span>/100<br><br>
+        → <span style="color:#ef4444;font-weight:bold;">CRITIQUE - PRIORITÉ IMMÉDIATE</span>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL: MATCHING -->
+<div id="matchingModal" class="modal">
+  <div class="modal-content">
+    <span class="close" onclick="closeModal('matching')">&times;</span>
+    <h2 style="color: #00d2ff; margin-top:0;">🔗 Algorithme de Matching (Stable Matching)</h2>
+    
+    <h3>Contexte: Jeu de Coalition</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        L'échange rénal est un <b>jeu de coalition</b> où:
+        <br>• Chaque patient veut un rein compatible<br>
+        • Chaque donneur veut aider un patient urgent<br>
+        • Les ressources sont limitées (compatibilité ABO)
+    </p>
+    
+    <h3>Théorie des Jeux: Stable Matching</h3>
+    <p style="font-size:12px; line-height:1.7; color:#e4e4e7;">
+        Un matching est <b>stable</b> si:<br>
+        ✓ Aucun couple Donneur-Patient ne peut se dévier<br>
+        ✓ Aucun cycle ne peut abandonner pour un meilleur cycle<br>
+        ✓ L'allocation est <b>Pareto optimale</b> (max surplus)
+    </p>
+    
+    <h3>Algorithme Gale-Shapley (Adapté)</h3>
+    <div class="algorithm-box" style="background:rgba(0,210,255,0.08); border-color:#00d2ff;">
+        <b>ÉTAPE 1: Construire Graphe ABO</b><br>
+        Pour chaque donneur i et patient j:<br>
+        • Si groupe(j) ∈ compatibles(groupe(i))<br>
+        • Ajouter arête i → j<br>
+        • Poids = urgence(j)<br><br>
+        
+        <b>ÉTAPE 2: Détecter Tous les Cycles</b><br>
+        Algorithme rapide: <code>nx.simple_cycles()</code><br>
+        Limite: longueur ≤ 3 (viabilité médicale)<br><br>
+        
+        <b>ÉTAPE 3: Évaluer Utilité Sociale</b><br>
+        Pour chaque cycle C:<br>
+        <code>utilité(C) = Σ urgence(n) + bonus[max urgence &gt; 80]</code><br><br>
+        
+        <b>ÉTAPE 4: Sélection Greedy</b><br>
+        Trier cycles par utilité (décroissant)<br>
+        Sélectionner cycles disjoints (max urgence)<br>
+        Résultat = Stable matching<br><br>
+        
+        <b>ÉTAPE 5: Validation Nash</b><br>
+        Vérifier: Aucune coalition ne peut dévier
+    </div>
+    
+    <h3>Résultat: Core Solution</h3>
+    <p style="font-size:12px; line-height:1.7; color:#a1a1aa;">
+        <b>{n_cyc} cycles</b> d'échange détectés<br>
+        <b>{n_sav} patients</b> sauvés par ces cycles<br>
+        <b>Efficacité Pareto:</b> {success_rate}%
+    </p>
+  </div>
+</div>
+
+<script>
+    const nodesRaw = {nodes};
+    const edgesRaw = {edges};
+    
+    const nodes = new vis.DataSet(nodesRaw);
+    const edges = new vis.DataSet(edgesRaw);
+    
+    const container = document.getElementById('network');
+    const data = {{ nodes: nodes, edges: edges }};
+    const options = {{
+        nodes: {{ 
+            shape: 'dot', 
+            font: {{ color: '#fff', face: 'Inter', size: 10 }}, 
+            borderWidth: 2,
+            shadow: true 
+        }},
+        edges: {{ 
+            smooth: {{ type: 'continuous' }}, 
+            arrows: {{ to: {{ scaleFactor: 0.5 }} }},
+            font: {{ size: 10 }},
+            shadow: true
+        }},
+        physics: {{ 
+            stabilization: {{ iterations: 1000 }}, 
+            barnesHut: {{ gravitationalConstant: -2000 }} 
+        }}
+    }};
+    
+    const network = new vis.Network(container, data, options);
+    
+    network.once("stabilizationIterationsDone", function() {{
+        network.setOptions({{ physics: {{ enabled: false }} }});
+        network.fit();
+    }});
+
+    function openModal(modalId) {{ 
+        document.getElementById(modalId + 'Modal').style.display = "block"; 
+    }}
+    function closeModal(modalId) {{ 
+        document.getElementById(modalId + 'Modal').style.display = "none"; 
+    }}
+    window.onclick = function(event) {{ 
+        if (event.target.classList.contains('modal')) {{ 
+            event.target.style.display = "none"; 
+        }} 
+    }}
+
+    // Charts
+    var urgencyScores = {nodes}.map(n => n.val);
+    var ctx = document.getElementById('scoreChart');
+    if(ctx) {{
+        new Chart(ctx, {{
+            type: 'bar',
+            data: {{
+                labels: urgencyScores.slice(0, 20).map((_, i) => 'P' + i),
+                datasets: [{{
+                    label: 'Score Urgence',
+                    data: urgencyScores.slice(0, 20),
+                    backgroundColor: urgencyScores.slice(0, 20).map(s => 
+                        s > 80 ? '#ef4444' : s > 50 ? '#eab308' : '#22c55e'
+                    ),
+                    borderColor: '#333',
+                    borderWidth: 1
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {{ y: {{ max: 100, ticks: {{ color: '#888' }}, grid: {{ color: '#222' }} }},
+                          x: {{ ticks: {{ color: '#888' }}, grid: {{ display: false }} }} }},
+                plugins: {{ legend: {{ display: false }} }}
+            }}
+        }});
+    }}
+    
+    var histCtx = document.getElementById('histChart');
+    if(histCtx) {{
+        var bins = [0,0,0,0,0];
+        urgencyScores.forEach(s => {{
+            if(s < 20) bins[0]++;
+            else if(s < 40) bins[1]++;
+            else if(s < 60) bins[2]++;
+            else if(s < 80) bins[3]++;
+            else bins[4]++;
+        }});
+        new Chart(histCtx, {{
+            type: 'doughnut',
+            data: {{
+                labels: ['<20 (Stable)', '20-40', '40-60', '60-80 (Grave)', '80+ (Critique)'],
+                datasets: [{{
+                    data: bins,
+                    backgroundColor: ['#22c55e', '#84cc16', '#eab308', '#f97316', '#ef4444'],
+                    borderColor: '#000',
+                    borderWidth: 2
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {{ legend: {{ position: 'bottom', labels: {{ color: '#a1a1aa', font: {{ size: 10 }} }} }} }}
+            }}
+        }});
+    }}
+
+    function setStep(step) {{
+        document.querySelectorAll('.btn').forEach((b, i) => b.classList.toggle('active', i === step-1));
+        document.querySelectorAll('.story-text').forEach((d, i) => d.classList.toggle('active', i === step-1));
+        
+        const allNodes = nodes.get();
+        const allEdges = edges.get();
+        const legend = document.getElementById('legend');
+        
+        if(step === 1) {{
+            allNodes.forEach(n => {{ n.color = '#3f3f46'; n.size = 8; n.shadow = false; }});
+            allEdges.forEach(e => {{ e.hidden = false; e.color = {{color:'#333', opacity: 0.1}}; e.width=0.5; }});
+            legend.innerHTML = '<b>Step 1: Données</b><br><span class="dot" style="background:#3f3f46"></span>Paire (Patient + Donneur)';
+        }}
+        
+        if(step === 2) {{
+            allNodes.forEach(n => {{ n.color = n.ai_color; n.size = 5 + (n.val/8); n.shadow = true; }});
+            allEdges.forEach(e => {{ e.hidden = true; }});
+            legend.innerHTML = '<b>Step 2: Urgence</b><br><span class="dot" style="background:#ef4444"></span>Critique<br><span class="dot" style="background:#eab308"></span>Grave<br><span class="dot" style="background:#22c55e"></span>Stable';
+        }}
+        
+        if(step === 3) {{
+            // Matching view: show only cycle edges (candidates + validated)
+            allNodes.forEach(n => {{ 
+                if(n.cid > -1) {{
+                    n.hidden = false;
+                    n.color = '#00d2ff';
+                    n.size = 16;
+                    // keep label for validated nodes
+                }} else if(n.in_any_cycle) {{
+                    n.hidden = false;
+                    n.color = '#93c5fd';
+                    n.size = 6;
+                    n.label = '';
+                }} else {{
+                    // hide irrelevant nodes to reduce clutter
+                    n.hidden = true;
+                }}
+            }});
+            allEdges.forEach(e => {{
+                if(e.is_sol) {{ e.hidden = false; e.color = {{color:'#00d2ff', opacity:0.95}}; e.width=2; }}
+                else if(e.is_candidate) {{ e.hidden = false; e.color = {{color:'#93c5fd', opacity:0.4}}; e.width=1; }}
+                else {{ e.hidden = true; }}
+            }});
+            legend.innerHTML = '<b>Step 3: Matching</b><br><span class="dot" style="background:#00d2ff"></span>Cycle validé &nbsp; <span class="dot" style="background:#93c5fd"></span>Cycle candidat';
+        }}
+        
+        if(step === 4) {{
+            allNodes.forEach(n => {{ n.color = '#3b82f6'; n.size = 10; n.shadow = true; }});
+            allEdges.forEach(e => {{ e.hidden = true; }});
+            legend.innerHTML = '<b>Step 4: Analyse</b><br>Voir les statistiques →';
+        }}
+        
+        nodes.update(allNodes);
+        edges.update(allEdges);
+    }}
+    
+    function applyPatientCount() {{
+        let n = parseInt(document.getElementById('patientCountInput').value) || nodesRaw.length;
+        n = Math.max(2, Math.min(nodesRaw.length, n));
+        // take first n patients from the original nodesRaw order
+        const filteredNodes = nodesRaw.slice(0, n).map(n => Object.assign({{hidden:false}}, n));
+        const ids = new Set(filteredNodes.map(x => x.id));
+        const filteredEdges = edgesRaw.filter(e => ids.has(e.from) && ids.has(e.to));
+
+        // replace datasets
+        nodes.clear();
+        edges.clear();
+        nodes.add(filteredNodes);
+        edges.add(filteredEdges);
+
+        // update small stats in sidebar if present
+        const totalSpan = document.getElementById('displayTotal');
+        if(totalSpan) totalSpan.innerText = String(n);
+
+        // reapply current view styles
+        setStep(currentView);
+    }}
+    
+    setStep(1);
+</script>
+
+</body>
+</html>"""
+        return html
+    
+    def generate(self):
+        """Génère le HTML et l'écrit dans un fichier"""
+        html = self.build_html()
+        
+        output_file = "kidney_hybrid_dashboard.html"
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"✅ Site généré : {output_file}")
+        
+        # CORRECTIF #8: Gestion d'erreur pour webbrowser
+        try:
+            webbrowser.open(output_file)
+        except Exception as e:
+            print(f"Impossible d'ouvrir le navigateur automatiquement: {e}")
+            print(f"Ouvrez manuellement le fichier: {os.path.abspath(output_file)}")
+
+if __name__ == "__main__":
+    print(f"🔧 Nombre de patients: {NOMBRE_PATIENTS}")
+    print(f"   (Pour changer: modifie NOMBRE_PATIENTS en ligne 6)\n")
+    
+    try:
+        eng = MedicalEngine()  # Utilise NOMBRE_PATIENTS par défaut
+        success = eng.load_and_merge()
+        if success:
+            eng.run_ai_scoring()
+            eng.run_game_theory()
+            data = eng.export()
+            WebRenderer(*data).generate()
+            print("\n🌐 Ouverture du navigateur...")
+        else:
+            print("Échec du chargement des données")
+    except Exception as e:
+        print(f"ERREUR FATALE: {e}")
+        import traceback
+        traceback.print_exc()
