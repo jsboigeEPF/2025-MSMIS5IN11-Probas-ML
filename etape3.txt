@@ -3,7 +3,7 @@
 # ============================================================
 # 🎛️ CONFIGURATION : CHANGE CE NOMBRE POUR ANALYSER PLUS/MOINS DE PATIENTS
 # ============================================================
-NOMBRE_PATIENTS = 10  # ← MODIFIE CE CHIFFRE (ex: 10, 30, 50, 100...)
+NOMBRE_PATIENTS = 30  # ← MODIFIE CE CHIFFRE (ex: 10, 30, 50, 100...)
 # ============================================================
 
 import os
