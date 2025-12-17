@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<body>
+<input type="file" id="fileInput" />
+<pre id="output"></pre>
+
+<script src="https://cdn.jsdelivr.net/npm/numpy-parser/dist/numpy-parser.min.js"></script>
+<script>
+document.getElementById("fileInput").addEventListener("change", function (event) {
+  const file = event.target.files[0];
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    const buffer = e.target.result;
+    const np = numpyParser.fromArrayBuffer(buffer);
+    document.getElementById("output").textContent =
+      "Shape: " + JSON.stringify(np.shape) + "\n\n" +
+      JSON.stringify(np.data.slice(0,2000), null, 2);
+  };
+  reader.readAsArrayBuffer(file);
+});
+</script>
+</body>
+</html>

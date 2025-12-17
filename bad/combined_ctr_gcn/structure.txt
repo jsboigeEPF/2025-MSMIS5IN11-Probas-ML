@@ -1,0 +1,17 @@
+卷 新加卷 的文件夹 PATH 列表
+卷序列号为 4AB4-5722
+D:.
+│  structure.txt
+│  
+├─test
+│      test_data.npy
+│      test_label.pkl
+│      
+├─train
+│      train_data.npy
+│      train_label.pkl
+│      
+└─val
+        val_data.npy
+        val_label.pkl
+        
